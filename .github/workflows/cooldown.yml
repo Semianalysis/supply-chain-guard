@@ -20,18 +20,12 @@ on:
         type: string
         default: "security/cooldown-override"
 
-  # Also support being called directly on this repo's own PRs (for self-testing)
+  # Runs on every PR. The check script short-circuits when no dep files
+  # changed (so non-dep PRs cost ~5 seconds of CI). We CANNOT use a paths
+  # filter here because this is wired as a required check via an org-level
+  # ruleset; if the workflow doesn't trigger, the required check sits at
+  # "Expected — Waiting for" forever and blocks merges.
   pull_request:
-    paths:
-      - "**/package-lock.json"
-      - "**/package.json"
-      - "**/yarn.lock"
-      - "**/pnpm-lock.yaml"
-      - "**/requirements*.txt"
-      - "**/pyproject.toml"
-      - "**/Pipfile.lock"
-      - "**/poetry.lock"
-      - "**/uv.lock"
 
 permissions:
   contents: read
