@@ -1,0 +1,9 @@
+{
+  "name": "cooldown-test-fixture",
+  "private": true,
+  "dependencies": {
+    "@tanstack/react-table": "*",
+    "express": "5.1.0",
+    "lodash": "^4.17.21"
+  }
+}
