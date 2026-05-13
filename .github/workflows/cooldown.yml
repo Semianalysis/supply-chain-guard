@@ -1,8 +1,11 @@
 name: Supply-chain cooldown check
 
-# Reusable workflow. Either:
-#   1. Called by other repos via `uses: Semianalysis/supply-chain-guard/.github/workflows/cooldown.yml@main`
-#   2. Or configured as an org-level Required Workflow pointing at this file.
+# Reusable workflow. Called by other repos either:
+#   1. Explicitly: `uses: Semianalysis/supply-chain-guard/.github/workflows/cooldown.yml@main`
+#   2. Or via the org-level Required Workflow ruleset (Mini Shai-Hulud guard).
+#
+# Supply-chain-guard itself is excluded from the ruleset; check.py changes are
+# gated by self-test.yml (pytest) rather than by this workflow.
 
 on:
   workflow_call:
@@ -20,19 +23,6 @@ on:
         type: string
         default: "security/cooldown-override"
 
-  # Also support being called directly on this repo's own PRs (for self-testing)
-  pull_request:
-    paths:
-      - "**/package-lock.json"
-      - "**/package.json"
-      - "**/yarn.lock"
-      - "**/pnpm-lock.yaml"
-      - "**/requirements*.txt"
-      - "**/pyproject.toml"
-      - "**/Pipfile.lock"
-      - "**/poetry.lock"
-      - "**/uv.lock"
-
 permissions:
   contents: read
   pull-requests: write   # for posting the finding comment
@@ -48,30 +38,9 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install resolver deps
-        # `packaging` is required by check.py's pypi_resolve_spec_latest
-        # to evaluate PEP 440 specifier sets. `npm` ships pre-installed
-        # on ubuntu-latest runners and powers the npm resolver.
-        run: pip install --no-cache-dir "packaging>=24,<26"
-
       - name: Run cooldown check
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          COOLDOWN_DAYS: ${{ inputs.cooldown_days || 7 }}
-          ALLOWED_SCOPES: ${{ inputs.allowed_scopes || '@types' }}
-          OVERRIDE_LABEL: ${{ inputs.override_label || 'security/cooldown-override' }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_FULL: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Pull the check script from this central repo and run it.
-          # Repo dispatches just need to call this workflow.
-          curl -sSfL https://raw.githubusercontent.com/Semianalysis/supply-chain-guard/main/check.py -o /tmp/cooldown_check.py
-          python /tmp/cooldown_check.py
+        uses: Semianalysis/supply-chain-guard@main
+        with:
+          cooldown_days: ${{ inputs.cooldown_days }}
+          allowed_scopes: ${{ inputs.allowed_scopes }}
+          override_label: ${{ inputs.override_label }}
