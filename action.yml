@@ -1,0 +1,45 @@
+name: 'Supply-chain cooldown check'
+description: 'Blocks PRs introducing newly-published npm/PyPI packages younger than the cooldown threshold.'
+inputs:
+  cooldown_days:
+    description: 'Age threshold in days'
+    required: false
+    default: '7'
+  allowed_scopes:
+    description: 'Comma-separated npm scopes always allowed (e.g. "@types,@vercel")'
+    required: false
+    default: '@types'
+  override_label:
+    description: 'PR label that bypasses the check'
+    required: false
+    default: 'security/cooldown-override'
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install resolver deps
+      # `packaging` is required by check.py's pypi_resolve_spec_latest to
+      # evaluate PEP 440 specifier sets. `npm` ships pre-installed on the
+      # ubuntu-latest runner and powers the npm resolver.
+      shell: bash
+      run: pip install --no-cache-dir 'packaging>=24,<26'
+
+    - name: Run cooldown check
+      shell: bash
+      env:
+        COOLDOWN_DAYS: ${{ inputs.cooldown_days }}
+        ALLOWED_SCOPES: ${{ inputs.allowed_scopes }}
+        OVERRIDE_LABEL: ${{ inputs.override_label }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO_FULL: ${{ github.repository }}
+        PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        GH_TOKEN: ${{ github.token }}
+      # github.action_path is the directory where this repo was cloned by
+      # the runner -- check.py sits next to action.yml there.
+      run: python "$GITHUB_ACTION_PATH/check.py"
