@@ -1,0 +1,30 @@
+name: Self-test
+
+# Runs the unit tests for `check.py` on every push and PR against
+# main. Keeps the spec-aware resolver honest — a regression here is
+# how false-positive cooldown failures slip back in.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "check.py"
+      - "check_test.py"
+      - ".github/workflows/self-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test deps
+        run: pip install --no-cache-dir "pytest>=8,<9" "packaging>=24,<26"
+      - name: Run pytest
+        run: pytest check_test.py -v

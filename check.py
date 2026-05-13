@@ -132,8 +132,53 @@ def parse_npm_lock(text: str) -> dict[str, str]:
     return out
 
 
+# Non-registry spec prefixes — packages declared this way are not
+# resolvable against npmjs.org, so the cooldown check has nothing
+# useful to say about them. Strip them at parse time so the
+# downstream resolver never sees them.
+#
+# Covered:
+#   workspace:*      pnpm / yarn / npm monorepo workspaces
+#   file:./local     local-path tarball / dir
+#   link:../sib      pnpm-style symlink
+#   git+https://     git URL
+#   git://           git URL (legacy)
+#   http://...       tarball URL
+#   https://...      tarball URL
+#   npm:<alias>@...  npm package aliases (only valid as a value)
+#   portal:...       yarn berry portal
+#   catalog:         pnpm catalog reference
+NPM_NON_REGISTRY_PREFIXES = (
+    "workspace:",
+    "file:",
+    "link:",
+    "git+",
+    "git:",
+    "http:",
+    "https:",
+    "npm:",
+    "portal:",
+    "catalog:",
+)
+
+
+def _is_non_registry_npm_spec(spec: str) -> bool:
+    """True for any npm version spec that the public registry can't
+    resolve (workspace deps, local paths, git URLs, etc.). Also
+    returns True for `*` because an unbounded range has no upper
+    side to age-check."""
+    if not isinstance(spec, str):
+        return True
+    if spec.strip() == "*":
+        return True
+    return spec.startswith(NPM_NON_REGISTRY_PREFIXES)
+
+
 def parse_npm_package_json(text: str) -> dict[str, str]:
-    """Return {pkg_name: spec_range} from a package.json."""
+    """Return {pkg_name: spec_range} from a package.json. Filters out
+    specs the public npm registry can't resolve (workspace:*, file:,
+    link:, git:, http(s):, npm:<alias>, portal:, catalog:, plain `*`)
+    — see _is_non_registry_npm_spec."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -141,6 +186,8 @@ def parse_npm_package_json(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for section in ("dependencies", "devDependencies", "optionalDependencies"):
         for pkg, spec in (data.get(section) or {}).items():
+            if _is_non_registry_npm_spec(spec):
+                continue
             out[pkg] = spec
     return out
 
@@ -306,16 +353,104 @@ def npm_publish_time(pkg: str, version: str) -> dt.datetime | None:
 
 
 def npm_resolve_range_latest(pkg: str, spec: str) -> str | None:
-    """Resolve a semver range to the latest matching version (simplified).
-    For un-pinned specs, returns the latest published version (most aggressive
-    interpretation - what a fresh `npm install` would pick today, modulo deeper
-    semver semantics)."""
+    """Return the highest version of `pkg` that satisfies the npm
+    spec range, using the `npm` CLI for semver evaluation.
+
+    Why shell out instead of reimplementing semver in Python:
+    semver-0 caret rules, prerelease gating, `||` unions, hyphen
+    ranges, and X-ranges are all subtle and well-tested inside
+    npm itself. The cost of `npm view <pkg>@<spec> version --json`
+    is one HTTP round-trip the script would have made anyway.
+
+    Behaviour:
+      - Returns the *highest* version satisfying `spec` (mirrors
+        what `npm install` would resolve to today, which is the
+        worst-case input for the age check).
+      - Returns None when nothing satisfies the spec (caller
+        treats this as out-of-scope, same as a 404).
+      - Falls back to `dist-tags.latest` if the `npm` CLI is
+        unavailable on the runner — conservative: a fallback
+        cooldown-failure is preferable to silently passing.
+    """
+    if _is_non_registry_npm_spec(spec):
+        return None
+    try:
+        result = subprocess.run(
+            ["npm", "view", f"{pkg}@{spec}", "version", "--json"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except FileNotFoundError:
+        log("  npm CLI not available; falling back to dist-tags.latest")
+        return _npm_dist_tags_latest_fallback(pkg)
+    except subprocess.TimeoutExpired:
+        log(f"  npm view {pkg}@{spec}: timed out")
+        return _npm_dist_tags_latest_fallback(pkg)
+    if result.returncode != 0:
+        # No version satisfies the range, or the package was
+        # unpublished entirely. Returning None lets the caller log
+        # this as an out-of-scope finding rather than a failure.
+        log(f"  npm view {pkg}@{spec}: rc={result.returncode}")
+        return None
+    return _parse_npm_view_output(result.stdout)
+
+
+def _npm_dist_tags_latest_fallback(pkg: str) -> str | None:
+    """Return `dist-tags.latest` from the npm registry. Used only as
+    a fallback when the `npm` CLI is unavailable or times out — the
+    primary resolver is spec-aware via `npm view`."""
     data = fetch_json(f"{NPM_REGISTRY}/{pkg}")
     if not data:
         return None
-    # If pkg has dist-tags.latest, use that as the candidate
-    latest = (data.get("dist-tags") or {}).get("latest")
-    return latest
+    return (data.get("dist-tags") or {}).get("latest")
+
+
+def _parse_npm_view_output(stdout: str) -> str | None:
+    """Pick the highest version from `npm view <pkg>@<spec> version --json`.
+
+    Output shape varies by match count:
+      - Single match: a JSON-encoded string, e.g. '"4.21.0"\n'.
+      - Multiple matches: a JSON array of strings, ordered ascending,
+        e.g. '["0.27.0", "0.27.7"]\n'.
+      - No matches: empty stdout (rc != 0, handled upstream).
+    We re-sort the array with a semver-aware key rather than
+    trusting npm's emitted order — cheap and defensive.
+    """
+    raw = stdout.strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # `npm view <pkg>@<pinned> version` (without --json mode
+        # falling back) emits the bare version string. Treat that
+        # as the value.
+        return raw
+    if isinstance(parsed, str):
+        return parsed
+    if isinstance(parsed, list) and parsed:
+        # Sort semver-ascending and pick the highest. Tuples of
+        # ints sort correctly for the common case; non-numeric
+        # parts (e.g. prereleases) sort to the bottom via a
+        # secondary fallback flag.
+        return max(parsed, key=_semver_sort_key)
+    return None
+
+
+def _semver_sort_key(version: str) -> tuple:
+    """Sort key that gives stable releases > prereleases of the same
+    core version. Handles e.g. `5.0.0-rc.1` < `5.0.0`. Not a full
+    semver implementation — we only need ordering for `max()`."""
+    core, sep, prerelease = version.partition("-")
+    # Strip build metadata if present (anything after `+`).
+    core = core.split("+", 1)[0]
+    try:
+        nums = tuple(int(p) for p in core.split("."))
+    except ValueError:
+        return (0,)
+    # Stable releases (no prerelease segment) outrank prereleases
+    # with the same core. SemVer 2.0.0 § 11 specifies this ordering.
+    is_stable = 0 if sep and prerelease else 1
+    return nums + (is_stable,)
 
 
 def pypi_publish_time(pkg: str, version: str) -> dt.datetime | None:
@@ -337,10 +472,49 @@ def pypi_publish_time(pkg: str, version: str) -> dt.datetime | None:
 
 
 def pypi_resolve_spec_latest(pkg: str, spec: str) -> str | None:
+    """Return the highest version of `pkg` that satisfies `spec`,
+    using PEP 440 specifier semantics via the `packaging` library.
+
+    Falls back to `info.version` (registry's latest) if:
+      - `packaging` isn't installed on the runner,
+      - the spec is empty / unparseable,
+      - or nothing in the registry satisfies it.
+
+    All three fall-backs are conservative: the cooldown check
+    would then evaluate the registry-latest's age, which is the
+    pre-fix behaviour. A clean fail still beats a silent pass.
+    """
     data = fetch_json(f"{PYPI_REGISTRY}/{pkg}/json")
     if not data:
         return None
-    return (data.get("info") or {}).get("version")
+    if not spec or spec.strip() == "*":
+        return (data.get("info") or {}).get("version")
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        log("  packaging not installed; falling back to info.version")
+        return (data.get("info") or {}).get("version")
+    try:
+        constraint = SpecifierSet(spec)
+    except InvalidSpecifier:
+        log(f"  pypi spec {spec!r} is not a valid PEP 440 specifier")
+        return (data.get("info") or {}).get("version")
+    candidates: list[Version] = []
+    for raw in (data.get("releases") or {}):
+        try:
+            ver = Version(raw)
+        except InvalidVersion:
+            continue
+        # Skip prereleases unless the spec explicitly allows them —
+        # matches `pip install`'s default behaviour.
+        if ver.is_prerelease and not constraint.prereleases:
+            continue
+        if ver in constraint:
+            candidates.append(ver)
+    if not candidates:
+        return None
+    return str(max(candidates))
 
 
 def lookup_publish_time(ecosystem: str, pkg: str, version_or_spec: str) -> tuple[str, dt.datetime | None]:

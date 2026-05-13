@@ -15,7 +15,28 @@ For each PR that touches a dependency file (`package-lock.json`, `package.json`,
 3. For each: queries the npm or PyPI registry for that version's publish time.
 4. Fails the check if any version is younger than the cooldown threshold.
 
-For unpinned ranges (e.g. `requests>=2.30` with no lockfile), the check resolves against the registry's latest matching version — the same version that would be installed at deploy time — and applies the same age test to it.
+For unpinned ranges (e.g. `requests>=2.30` with no lockfile), the check resolves against the registry's **highest version that satisfies the spec** — the same version that would be installed at deploy time — and applies the age test to it.
+
+This means a pin like `"@anthropic-ai/sdk": "^0.69.0"` resolves to the highest `0.69.x` published, not to whatever the registry currently tags as `latest`. Under semver-0 caret rules `^0.69.0` cannot resolve past `0.70.0`, so a fresh `1.0.0` published yesterday is irrelevant to the age check.
+
+Resolution happens via:
+  - **npm**: shells out to `npm view <pkg>@<spec> version --json`. The runner's `npm` does all the semver work (caret, tilde, hyphen ranges, `||` unions, X-ranges, prerelease gating).
+  - **PyPI**: uses [`packaging`](https://packaging.pypa.io/)'s `SpecifierSet` — the same library `pip` itself uses for PEP 440 specifier evaluation.
+
+## What gets skipped
+
+Some dependency specs aren't resolvable against the public npm registry, so the check has nothing useful to say about them. These are skipped at parse time and never appear in the report:
+
+  - `workspace:*` / `workspace:^x.y.z` — pnpm / yarn / npm workspace links.
+  - `file:./local-path` — local tarballs or directories.
+  - `link:../sibling` — pnpm symlink-based deps.
+  - `git+https://`, `git://` — git URLs.
+  - `http://`, `https://` — tarball URLs.
+  - `npm:<alias>@<spec>` — package aliases.
+  - `portal:...`, `catalog:...` — yarn berry portals, pnpm catalogs.
+  - `*` — unbounded ranges with no upper side to age-check.
+
+If you genuinely want a non-registry dep audited, review it manually.
 
 ## Override
 
