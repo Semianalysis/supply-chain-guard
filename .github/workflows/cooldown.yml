@@ -1,11 +1,17 @@
 name: Supply-chain cooldown check
 
-# Reusable workflow. Called by other repos either:
-#   1. Explicitly: `uses: Semianalysis/supply-chain-guard/.github/workflows/cooldown.yml@main`
-#   2. Or via the org-level Required Workflow ruleset (Mini Shai-Hulud guard).
+# Reusable workflow + required-workflow target.
 #
-# Supply-chain-guard itself is excluded from the ruleset; check.py changes are
-# gated by self-test.yml (pytest) rather than by this workflow.
+# Triggered two ways:
+#   1. Auto-injected by the org-level Required Workflow ruleset on every
+#      PR matching the dep-file paths below. This is what makes the
+#      check show up as `cooldown-check` on every PR org-wide.
+#   2. Called explicitly by another workflow via
+#      `uses: Semianalysis/supply-chain-guard/.github/workflows/cooldown.yml@main`
+#
+# The `pull_request` trigger is REQUIRED for the ruleset to inject the
+# workflow. Dropping it makes GitHub mark the rule as "Workflow
+# configuration invalid" and no cooldown-check runs at all.
 
 on:
   workflow_call:
@@ -22,6 +28,18 @@ on:
         required: false
         type: string
         default: "security/cooldown-override"
+
+  pull_request:
+    paths:
+      - "**/package-lock.json"
+      - "**/package.json"
+      - "**/yarn.lock"
+      - "**/pnpm-lock.yaml"
+      - "**/requirements*.txt"
+      - "**/pyproject.toml"
+      - "**/Pipfile.lock"
+      - "**/poetry.lock"
+      - "**/uv.lock"
 
 permissions:
   contents: read
@@ -41,6 +59,6 @@ jobs:
       - name: Run cooldown check
         uses: Semianalysis/supply-chain-guard@main
         with:
-          cooldown_days: ${{ inputs.cooldown_days }}
-          allowed_scopes: ${{ inputs.allowed_scopes }}
-          override_label: ${{ inputs.override_label }}
+          cooldown_days: ${{ inputs.cooldown_days || 7 }}
+          allowed_scopes: ${{ inputs.allowed_scopes || '@types' }}
+          override_label: ${{ inputs.override_label || 'security/cooldown-override' }}
