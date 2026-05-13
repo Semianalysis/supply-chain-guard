@@ -53,6 +53,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install resolver deps
+        # `packaging` is required by check.py's pypi_resolve_spec_latest
+        # to evaluate PEP 440 specifier sets. `npm` ships pre-installed
+        # on ubuntu-latest runners and powers the npm resolver.
+        run: pip install --no-cache-dir "packaging>=24,<26"
+
       - name: Run cooldown check
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
