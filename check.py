@@ -541,12 +541,52 @@ def lookup_publish_time(ecosystem: str, pkg: str, version_or_spec: str) -> tuple
 # Main
 # ----------------------------------------------------------------------------
 
+def fetch_current_labels() -> set[str]:
+    """Fetch labels currently on the PR via the REST API.
+
+    The workflow passes PR_LABELS sourced from `github.event.pull_request.labels`,
+    which is the event payload captured when the workflow was triggered.
+    On a manual re-run of a previously-failed cooldown check, GitHub replays
+    the original event payload -- so a label added between the original run
+    and the re-run is invisible. Same hazard applies if a label is added
+    BEFORE the `labeled` trigger type fires.
+
+    This API call returns the current label set at workflow runtime, which
+    is what the override gate actually wants to check.
+
+    Returns an empty set on any failure (no token, no PR, API error) -- the
+    caller treats that the same as 'no override applied'.
+    """
+    pr_number = env("PR_NUMBER")
+    repo_full = env("REPO_FULL")
+    token = env("GH_TOKEN")
+    if not (pr_number and repo_full and token):
+        return set()
+    url = f"https://api.github.com/repos/{repo_full}/issues/{pr_number}/labels"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return {item["name"] for item in data if isinstance(item, dict) and "name" in item}
+    except Exception as e:
+        log(f"  fetch_current_labels: {e}")
+        return set()
+
+
 def main() -> int:
     base_ref = env("BASE_REF", "main")
     cooldown_days = int(env("COOLDOWN_DAYS", "7"))
     allowed_scopes = {s.strip() for s in env("ALLOWED_SCOPES").split(",") if s.strip()}
     override_label = env("OVERRIDE_LABEL", "security/cooldown-override")
+    # Event-payload labels first; supplement with current labels from the
+    # API so a rerun after `labeled` (or after the workflow YAML missed
+    # the labeled trigger type) still sees the override.
     pr_labels = {s.strip() for s in env("PR_LABELS").split(",") if s.strip()}
+    pr_labels |= fetch_current_labels()
 
     log(f"[cooldown] base_ref={base_ref}  cooldown_days={cooldown_days}")
     log(f"[cooldown] allowed_scopes={sorted(allowed_scopes) if allowed_scopes else '(none)'}")
