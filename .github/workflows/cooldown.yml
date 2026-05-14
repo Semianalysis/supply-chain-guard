@@ -30,6 +30,10 @@ on:
         default: "security/cooldown-override"
 
   pull_request:
+    # Include `labeled` / `unlabeled` so adding the override label
+    # retriggers the check natively, without needing a new commit.
+    # Default types are [opened, synchronize, reopened].
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "**/package-lock.json"
       - "**/package.json"
