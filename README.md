@@ -8,7 +8,9 @@ Most supply-chain worms (Mini Shai-Hulud, Shai-Hulud, the original event-stream 
 
 ## What it checks
 
-For each PR that touches a dependency file (`package-lock.json`, `package.json`, `requirements.txt`, `pyproject.toml`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `yarn.lock`, `pnpm-lock.yaml`), the action:
+The action runs on every PR (the workflow has no `paths:` filter — see the comment in `.github/workflows/cooldown.yml` for why). On PRs that don't touch a dependency file the job exits in seconds with a "no dependency files changed" pass.
+
+When a PR does touch a dep file (`package-lock.json`, `package.json`, `requirements.txt`, `pyproject.toml`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `yarn.lock`, `pnpm-lock.yaml`), the action:
 
 1. Diffs the file against the PR's base branch.
 2. Identifies new or version-changed packages (direct + transitive).

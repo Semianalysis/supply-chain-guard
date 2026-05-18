@@ -4,14 +4,19 @@ name: Supply-chain cooldown check
 #
 # Triggered two ways:
 #   1. Auto-injected by the org-level Required Workflow ruleset on every
-#      PR matching the dep-file paths below. This is what makes the
-#      check show up as `cooldown-check` on every PR org-wide.
+#      PR. This is what makes the check show up as `cooldown-check` on
+#      every PR org-wide.
 #   2. Called explicitly by another workflow via
 #      `uses: Semianalysis/supply-chain-guard/.github/workflows/cooldown.yml@main`
 #
-# The `pull_request` trigger is REQUIRED for the ruleset to inject the
-# workflow. Dropping it makes GitHub mark the rule as "Workflow
-# configuration invalid" and no cooldown-check runs at all.
+# IMPORTANT: do NOT add a `paths:` filter to `pull_request` here. Cross-
+# repo Required Workflows do not get a synthetic "Skipped" conclusion
+# when the path filter doesn't match — the required check just hangs
+# forever as "Expected — Waiting for workflow to run", blocking merges
+# on every PR that doesn't touch a dep file. `check.py` already
+# short-circuits when no dep files changed (writes a "✅ No dependency
+# files changed." summary and exits 0), so it's safe and cheap to run
+# the workflow on every PR.
 
 on:
   workflow_call:
@@ -29,17 +34,7 @@ on:
         type: string
         default: "security/cooldown-override"
 
-  pull_request:
-    paths:
-      - "**/package-lock.json"
-      - "**/package.json"
-      - "**/yarn.lock"
-      - "**/pnpm-lock.yaml"
-      - "**/requirements*.txt"
-      - "**/pyproject.toml"
-      - "**/Pipfile.lock"
-      - "**/poetry.lock"
-      - "**/uv.lock"
+  pull_request: {}
 
 permissions:
   contents: read
