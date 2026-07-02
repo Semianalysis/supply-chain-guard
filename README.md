@@ -40,6 +40,12 @@ Some dependency specs aren't resolvable against the public npm registry, so the 
 
 If you genuinely want a non-registry dep audited, review it manually.
 
+## The initial-commit blind spot (and the daily scan that covers it)
+
+Required workflows only run on pull requests. The push that *creates* a repo's default branch (initial commit, "Add README" auto-init) can never satisfy one — so the org ruleset sets `do_not_enforce_on_create: true` to keep repo creation from being blocked outright. That means a brand-new repo's initial commit is never PR-checked, and since the PR check only diffs against the base branch, packages present at creation are grandfathered forever.
+
+`scan_new_repos.py` (run daily by `.github/workflows/new-repo-scan.yml`) closes the gap after the fact: it finds repos created in the last 2 days and age-checks the **full contents** of every dependency file on their default branch. Violations can't be blocked — the commit already landed — so the job goes red, writes a step summary, and posts to Slack (`SLACK_BOT_TOKEN` secret + `SLACK_CHANNEL_ID` repo variable). The org-repo listing needs the `ORG_SCAN_TOKEN` secret since the default Actions token can't see other repos.
+
 ## Override
 
 Add the `security/cooldown-override` label to a PR to bypass the check after manual review. The bypass is logged in PR history and visible to anyone auditing later.

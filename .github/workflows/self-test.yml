@@ -11,6 +11,8 @@ on:
     paths:
       - "check.py"
       - "check_test.py"
+      - "scan_new_repos.py"
+      - "scan_new_repos_test.py"
       - ".github/workflows/self-test.yml"
 
 permissions:
@@ -27,4 +29,4 @@ jobs:
       - name: Install test deps
         run: pip install --no-cache-dir "pytest>=8,<9" "packaging>=24,<26"
       - name: Run pytest
-        run: pytest check_test.py -v
+        run: pytest check_test.py scan_new_repos_test.py -v

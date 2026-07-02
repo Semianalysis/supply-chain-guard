@@ -1,0 +1,45 @@
+name: New-repo cooldown scan
+
+# Daily audit of repos created in the last LOOKBACK_DAYS. The org-level
+# Required Workflow only runs on PRs, so a repo's initial commit is never
+# cooldown-checked and its contents are grandfathered by the diff-based PR
+# check forever after. This scan closes that blind spot after the fact:
+# it age-checks the FULL contents of every dependency file in newly
+# created repos and reports violations (red job + step summary + Slack).
+#
+# Secrets / variables:
+#   ORG_SCAN_TOKEN    (secret)   token with org-wide repo read — the default
+#                                github.token only sees this repo
+#   SLACK_BOT_TOKEN   (secret)   optional, for posting findings
+#   SLACK_CHANNEL_ID  (variable) optional, channel for the post
+
+on:
+  schedule:
+    - cron: "17 12 * * *"  # daily, 12:17 UTC (offset to dodge top-of-hour load)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install resolver deps
+        run: pip install --no-cache-dir 'packaging>=24,<26'
+
+      - name: Scan newly created repos
+        env:
+          GH_TOKEN: ${{ secrets.ORG_SCAN_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          LOOKBACK_DAYS: "2"
+          COOLDOWN_DAYS: "7"
+          ALLOWED_SCOPES: "@types"
+        run: python scan_new_repos.py

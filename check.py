@@ -538,6 +538,47 @@ def lookup_publish_time(ecosystem: str, pkg: str, version_or_spec: str) -> tuple
 
 
 # ----------------------------------------------------------------------------
+# Age check (shared by the PR check below and scan_new_repos.py)
+# ----------------------------------------------------------------------------
+
+def age_check_packages(
+    pairs: dict[str, dict[str, str]],
+    cooldown_days: int,
+    allowed_scopes: set[str],
+) -> list[dict[str, Any]]:
+    """Fan out registry lookups for {ecosystem: {pkg: version_or_spec}} and
+    return one result dict per package with age/young/skipped fields."""
+    now = dt.datetime.now(dt.timezone.utc)
+    threshold = dt.timedelta(days=cooldown_days)
+
+    def check_one(ecosystem: str, pkg: str, ver: str) -> dict[str, Any]:
+        if "/" in pkg:
+            scope = "@" + pkg.split("/")[0].lstrip("@")
+            if scope in allowed_scopes:
+                return {"pkg": pkg, "version": ver, "skipped": "allowlisted scope"}
+        resolved, publish_time = lookup_publish_time(ecosystem, pkg, ver)
+        if publish_time is None:
+            return {"pkg": pkg, "version": ver, "resolved": resolved,
+                    "publish_time": None, "age_days": None, "ecosystem": ecosystem}
+        age = now - publish_time
+        return {
+            "pkg": pkg, "version": ver, "resolved": resolved,
+            "publish_time": publish_time.isoformat(),
+            "age_days": age.total_seconds() / 86400.0,
+            "young": age < threshold,
+            "ecosystem": ecosystem,
+        }
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        tasks = [
+            (ecosystem, pkg, ver)
+            for ecosystem, items in pairs.items()
+            for pkg, ver in items.items()
+        ]
+        return list(ex.map(lambda t: check_one(*t), tasks))
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -586,36 +627,7 @@ def main() -> int:
     total_to_check = sum(len(v) for v in pairs.values())
     log(f"[cooldown] checking {total_to_check} new/changed package(s) across {len(pairs)} ecosystem(s)")
 
-    findings: list[dict[str, Any]] = []
-    now = dt.datetime.now(dt.timezone.utc)
-    threshold = dt.timedelta(days=cooldown_days)
-
-    # Fan out to registry queries
-    def check_one(ecosystem: str, pkg: str, ver: str) -> dict[str, Any]:
-        if "/" in pkg:
-            scope = "@" + pkg.split("/")[0].lstrip("@")
-            if scope in allowed_scopes:
-                return {"pkg": pkg, "version": ver, "skipped": "allowlisted scope"}
-        resolved, publish_time = lookup_publish_time(ecosystem, pkg, ver)
-        if publish_time is None:
-            return {"pkg": pkg, "version": ver, "resolved": resolved,
-                    "publish_time": None, "age_days": None, "ecosystem": ecosystem}
-        age = now - publish_time
-        return {
-            "pkg": pkg, "version": ver, "resolved": resolved,
-            "publish_time": publish_time.isoformat(),
-            "age_days": age.total_seconds() / 86400.0,
-            "young": age < threshold,
-            "ecosystem": ecosystem,
-        }
-
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        tasks = [
-            (ecosystem, pkg, ver)
-            for ecosystem, items in pairs.items()
-            for pkg, ver in items.items()
-        ]
-        results = list(ex.map(lambda t: check_one(*t), tasks))
+    results = age_check_packages(pairs, cooldown_days, allowed_scopes)
 
     young = [r for r in results if r.get("young")]
     unresolved = [r for r in results if r.get("publish_time") is None and "skipped" not in r]
