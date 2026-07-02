@@ -39,6 +39,7 @@ import datetime as dt
 import json
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -59,7 +60,18 @@ GITHUB_API = "https://api.github.com"
 # GitHub API (authenticated — check.py's fetch_json is anonymous-registry only)
 # ----------------------------------------------------------------------------
 
-def gh_get(path: str, token: str, accept: str = "application/vnd.github+json") -> Any:
+def gh_get(
+    path: str,
+    token: str,
+    accept: str = "application/vnd.github+json",
+    missing_ok: bool = False,
+) -> Any:
+    """GET a GitHub API path. With missing_ok, 404/409 return None —
+    only appropriate for per-repo lookups where absence is expected
+    (empty repo, file vanished between tree and contents calls). Calls
+    where a 404 means misconfiguration (bad org, token without access)
+    must leave missing_ok off so the scan fails loudly instead of
+    reporting a clean run."""
     req = urllib.request.Request(
         f"{GITHUB_API}{path}",
         headers={
@@ -72,9 +84,7 @@ def gh_get(path: str, token: str, accept: str = "application/vnd.github+json") -
         with urllib.request.urlopen(req, timeout=30) as r:
             body = r.read().decode("utf-8")
     except urllib.error.HTTPError as e:
-        # 404: empty repo / file vanished between tree and contents calls.
-        # 409: repo exists but has no commits yet ("Git Repository is empty").
-        if e.code in (404, 409):
+        if missing_ok and e.code in (404, 409):
             return None
         raise
     return body if accept.endswith(".raw") else json.loads(body)
@@ -110,7 +120,12 @@ def is_dep_file(path: str) -> bool:
 
 def repo_dep_files(org: str, repo: str, default_branch: str, token: str) -> list[str]:
     """Paths of all dependency files on the default branch."""
-    tree = gh_get(f"/repos/{org}/{repo}/git/trees/{default_branch}?recursive=1", token)
+    # Quote the branch: names like "releases/main" would otherwise split
+    # into extra URL path segments and 404.
+    branch = urllib.parse.quote(default_branch, safe="")
+    tree = gh_get(
+        f"/repos/{org}/{repo}/git/trees/{branch}?recursive=1", token, missing_ok=True
+    )
     if not tree:
         return []
     if tree.get("truncated"):
@@ -246,10 +261,13 @@ def main() -> int:
             continue
         files = []
         for path in paths:
+            quoted_path = urllib.parse.quote(path)
+            quoted_branch = urllib.parse.quote(branch, safe="")
             text = gh_get(
-                f"/repos/{org}/{name}/contents/{path}?ref={branch}",
+                f"/repos/{org}/{name}/contents/{quoted_path}?ref={quoted_branch}",
                 token,
                 accept="application/vnd.github.raw",
+                missing_ok=True,
             )
             if text is not None:
                 files.append((path, text))
