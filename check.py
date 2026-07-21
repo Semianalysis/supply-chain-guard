@@ -587,11 +587,17 @@ def main() -> int:
     cooldown_days = int(env("COOLDOWN_DAYS", "7"))
     allowed_scopes = {s.strip() for s in env("ALLOWED_SCOPES").split(",") if s.strip()}
     override_label = env("OVERRIDE_LABEL", "security/cooldown-override")
-    pr_labels = {s.strip() for s in env("PR_LABELS").split(",") if s.strip()}
+    # Labels from the (possibly stale) event payload...
+    payload_labels = {s.strip() for s in env("PR_LABELS").split(",") if s.strip()}
+    # ...unioned with a live API read so an override added after the PR
+    # opened (or applied between re-runs) is honoured immediately. See
+    # live_pr_labels() for why the payload alone is not enough.
+    pr_labels = payload_labels | live_pr_labels()
 
     log(f"[cooldown] base_ref={base_ref}  cooldown_days={cooldown_days}")
     log(f"[cooldown] allowed_scopes={sorted(allowed_scopes) if allowed_scopes else '(none)'}")
-    log(f"[cooldown] override_label={override_label}  PR labels={sorted(pr_labels)}")
+    log(f"[cooldown] override_label={override_label}  PR labels={sorted(pr_labels)} "
+        f"(payload={sorted(payload_labels)})")
 
     if override_label in pr_labels:
         log(f"[cooldown] override label {override_label!r} present - passing without check")
@@ -683,6 +689,53 @@ def write_summary(text: str) -> None:
             f.write(text + "\n")
     except OSError:
         pass
+
+
+def live_pr_labels() -> set[str]:
+    """Fetch the PR's labels *live* from the GitHub API.
+
+    Why this exists: the action passes labels in via ``PR_LABELS`` from
+    ``github.event.pull_request.labels`` — but that payload is a snapshot
+    frozen when the triggering event fired. Two common cases leave it
+    stale, so an override label the PR *currently* carries is invisible:
+
+      1. The label is added *after* the PR opened. Re-running the check
+         (the "Re-run jobs" button) replays the ORIGINAL event payload —
+         GitHub does not refresh ``github.event.*`` on a re-run — so the
+         freshly-added label never shows up no matter how many times you
+         retry.
+      2. Cross-repo Required Workflows are not re-dispatched on every PR
+         activity type (e.g. ``labeled``), so no fresh run with the new
+         label may ever be produced on its own.
+
+    Reading labels live from ``/issues/{n}`` sidesteps both: the override
+    is honoured the instant it's on the PR, without needing a new commit
+    or a re-run. Returns an empty set (caller falls back to payload
+    labels) if the token/PR context is missing or the request fails —
+    never blocks the check on a transient API hiccup.
+    """
+    pr_num = env("PR_NUMBER")
+    repo_full = env("REPO_FULL")
+    token = env("GH_TOKEN")
+    if not (pr_num and repo_full and token):
+        return set()
+    url = f"https://api.github.com/repos/{repo_full}/issues/{pr_num}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        log(f"  could not fetch live PR labels: {e}")
+        return set()
+    labels = set()
+    for lab in data.get("labels") or []:
+        name = lab.get("name") if isinstance(lab, dict) else lab
+        if name:
+            labels.add(name.strip())
+    return labels
 
 
 def post_pr_comment(text: str) -> None:
