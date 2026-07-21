@@ -281,3 +281,74 @@ def test_pypi_resolver_no_match_returns_none() -> None:
 def test_pypi_resolver_fetch_failure_returns_none() -> None:
     with patch.object(check, "fetch_json", return_value=None):
         assert check.pypi_resolve_spec_latest("foo", "==1.0.0") is None
+
+
+# --- live_pr_labels: the override-visibility fix -----------------------------
+#
+# Regression net for the stale-payload bug: an override label added after
+# a PR opened (or between re-runs, which replay the original event payload)
+# was invisible because the action only read github.event.*.labels. These
+# tests pin the live API read that fixes it.
+
+import io  # noqa: E402  (test-local import, kept next to its users)
+import os  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def _label_env(pr="78", repo="Semianalysis/llm-api-test", token="tok"):
+    """Set the env live_pr_labels() reads, restoring prior values after."""
+    prev = {k: os.environ.get(k) for k in ("PR_NUMBER", "REPO_FULL", "GH_TOKEN")}
+    for k, v in {"PR_NUMBER": pr, "REPO_FULL": repo, "GH_TOKEN": token}.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _issue_response(*label_names):
+    body = json.dumps(
+        {"labels": [{"name": n} for n in label_names]}
+    ).encode("utf-8")
+    return io.BytesIO(body)
+
+
+def test_live_pr_labels_reads_current_labels() -> None:
+    with _label_env(), patch.object(check.urllib.request, "urlopen") as mock_open:
+        mock_open.return_value.__enter__.return_value = _issue_response(
+            "security/cooldown-override", "dependencies"
+        )
+        assert check.live_pr_labels() == {
+            "security/cooldown-override",
+            "dependencies",
+        }
+
+
+def test_live_pr_labels_empty_without_context() -> None:
+    # No token/PR context -> empty set (caller falls back to payload).
+    with _label_env(token=None):
+        assert check.live_pr_labels() == set()
+
+
+def test_live_pr_labels_empty_on_api_error() -> None:
+    with _label_env(), patch.object(
+        check.urllib.request, "urlopen", side_effect=Exception("boom")
+    ):
+        # A transient API failure must never block the check.
+        assert check.live_pr_labels() == set()
+
+
+def test_live_pr_labels_strips_and_ignores_blank_names() -> None:
+    with _label_env(), patch.object(check.urllib.request, "urlopen") as mock_open:
+        mock_open.return_value.__enter__.return_value = _issue_response(
+            "  spaced  ", ""
+        )
+        assert check.live_pr_labels() == {"spaced"}

@@ -50,6 +50,8 @@ Required workflows only run on pull requests. The push that *creates* a repo's d
 
 Add the `security/cooldown-override` label to a PR to bypass the check after manual review. The bypass is logged in PR history and visible to anyone auditing later.
 
+The label is read **live from the GitHub API** at check time (in addition to the event payload), so it takes effect the moment it's on the PR — you do **not** need to push a new commit or re-run the job. (Historically the action only read `github.event.pull_request.labels`, which is a snapshot frozen when the triggering event fired; a label added afterwards was invisible, and "Re-run jobs" replays the original payload rather than refreshing it, so retries never picked it up.) If a stale run is still showing red, a fresh run — via a new push or the "Re-run" button — will now re-read the current labels and pass.
+
 ## Allowlist
 
 Trusted scopes can be pre-allowed via the `allowed_scopes` input. Default: `@types`. Add others (e.g. `@vercel`, `@radix-ui`) by passing the input when calling the workflow.
