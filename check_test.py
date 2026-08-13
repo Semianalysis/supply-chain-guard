@@ -496,7 +496,13 @@ def test_report_contains_fix_oneliner_and_urls() -> None:
         "url": "https://sfw.semianalysis.com/npm/shell-quote/-/shell-quote-1.8.4.tgz",
     }]
     report = check.private_registry_report(findings)
-    assert "sed -i" in report
-    assert "registry.npmjs.org" in report
+    # Exact-match the paved-road fix line (equality, not substring: CodeQL's
+    # py/incomplete-url-substring-sanitization heuristic misreads hostname
+    # substring-membership asserts as URL sanitization).
+    sed_lines = [ln for ln in report.splitlines() if ln.startswith("sed -i")]
+    assert sed_lines == [
+        r"sed -i 's|https://sfw\.semianalysis\.com\(:[0-9]*\)\?/npm/"
+        r"|https://registry.npmjs.org/|g' package-lock.json"
+    ]
     assert "shell-quote-1.8.4.tgz" in report
     assert "replace-registry-host" in report
