@@ -352,3 +352,151 @@ def test_live_pr_labels_strips_and_ignores_blank_names() -> None:
             "  spaced  ", ""
         )
         assert check.live_pr_labels() == {"spaced"}
+
+
+# --- private-registry tripwire ------------------------------------------------
+#
+# Lockfiles must stay canonical-public: URLs on the org's Socket Firewall
+# proxy 401 for every credential-less environment (Dependabot, Vercel, CI).
+# The check is diff-based - it fails only URLs the PR *introduces*, so the
+# repos whose lockfiles still carry legacy sfw entries aren't blocked on
+# unrelated PRs.
+
+SFW = ["sfw.semianalysis.com"]
+
+LOCK_BEFORE = json.dumps({
+    "packages": {
+        "node_modules/express": {
+            "version": "4.22.2",
+            "resolved": "https://registry.npmjs.org/express/-/express-4.22.2.tgz",
+        },
+    }
+})
+
+LOCK_AFTER_SFW = json.dumps({
+    "packages": {
+        "node_modules/express": {
+            "version": "4.22.2",
+            "resolved": "https://registry.npmjs.org/express/-/express-4.22.2.tgz",
+        },
+        "node_modules/shell-quote": {
+            "version": "1.8.4",
+            "resolved": "https://sfw.semianalysis.com/npm/shell-quote/-/shell-quote-1.8.4.tgz",
+        },
+    }
+})
+
+
+def test_private_registry_urls_extraction() -> None:
+    urls = check._private_registry_urls(LOCK_AFTER_SFW, SFW)
+    assert urls == {
+        "https://sfw.semianalysis.com/npm/shell-quote/-/shell-quote-1.8.4.tgz"
+    }
+
+
+def test_private_registry_urls_matches_port_variant() -> None:
+    text = '"resolved": "https://sfw.semianalysis.com:8443/npm/foo/-/foo-1.0.0.tgz"'
+    urls = check._private_registry_urls(text, SFW)
+    assert urls == {"https://sfw.semianalysis.com:8443/npm/foo/-/foo-1.0.0.tgz"}
+
+
+def test_private_registry_urls_ignores_public_hosts() -> None:
+    assert check._private_registry_urls(LOCK_BEFORE, SFW) == set()
+
+
+def test_private_registry_urls_does_not_match_subdomain_prefix() -> None:
+    # `notsfw.semianalysis.com` must not match `sfw.semianalysis.com`...
+    # it does contain the substring, but the regex requires the scheme
+    # directly before the host, so only a genuine URL host matches.
+    text = '"resolved": "https://notsfw.semianalysis.com/npm/foo/-/foo-1.0.0.tgz"'
+    assert check._private_registry_urls(text, SFW) == set()
+
+
+def _mock_file_at_ref(files: dict[tuple[str, str], str]):
+    """Return a file_at_ref stand-in backed by {(ref, path): text}."""
+    def fake(ref: str, path: str) -> str | None:
+        return files.get((ref, path))
+    return fake
+
+
+def test_findings_only_for_introduced_urls() -> None:
+    files = {
+        ("origin/main", "package-lock.json"): LOCK_BEFORE,
+        ("HEAD", "package-lock.json"): LOCK_AFTER_SFW,
+    }
+    with patch.object(check, "file_at_ref", side_effect=_mock_file_at_ref(files)):
+        findings = check.private_registry_findings(
+            ["package-lock.json"], "main", SFW
+        )
+    assert findings == [{
+        "path": "package-lock.json",
+        "url": "https://sfw.semianalysis.com/npm/shell-quote/-/shell-quote-1.8.4.tgz",
+    }]
+
+
+def test_preexisting_urls_are_not_findings() -> None:
+    # The sfw URL exists at base and head: legacy stock, not this PR's delta.
+    files = {
+        ("origin/main", "package-lock.json"): LOCK_AFTER_SFW,
+        ("HEAD", "package-lock.json"): LOCK_AFTER_SFW,
+    }
+    with patch.object(check, "file_at_ref", side_effect=_mock_file_at_ref(files)):
+        assert check.private_registry_findings(
+            ["package-lock.json"], "main", SFW
+        ) == []
+
+
+def test_removing_urls_is_not_a_finding() -> None:
+    # The normalization PRs themselves (sfw -> npmjs rewrite) must pass.
+    files = {
+        ("origin/main", "package-lock.json"): LOCK_AFTER_SFW,
+        ("HEAD", "package-lock.json"): LOCK_BEFORE,
+    }
+    with patch.object(check, "file_at_ref", side_effect=_mock_file_at_ref(files)):
+        assert check.private_registry_findings(
+            ["package-lock.json"], "main", SFW
+        ) == []
+
+
+def test_new_lockfile_with_sfw_urls_is_a_finding() -> None:
+    # File absent at base (file_at_ref returns None) -> every URL is new.
+    files = {("HEAD", "pnpm-lock.yaml"): (
+        "tarball: https://sfw.semianalysis.com/npm/foo/-/foo-2.0.0.tgz"
+    )}
+    with patch.object(check, "file_at_ref", side_effect=_mock_file_at_ref(files)):
+        findings = check.private_registry_findings(
+            ["pnpm-lock.yaml"], "main", SFW
+        )
+    assert [f["url"] for f in findings] == [
+        "https://sfw.semianalysis.com/npm/foo/-/foo-2.0.0.tgz"
+    ]
+
+
+def test_manifest_files_are_not_scanned() -> None:
+    # package.json / requirements.txt never carry resolved URLs; a doc
+    # string mentioning the proxy host must not fail the PR.
+    files = {
+        ("HEAD", "package.json"): '{"comment": "https://sfw.semianalysis.com/npm/"}',
+    }
+    with patch.object(check, "file_at_ref", side_effect=_mock_file_at_ref(files)):
+        assert check.private_registry_findings(
+            ["package.json"], "main", SFW
+        ) == []
+
+
+def test_empty_hosts_disables_check() -> None:
+    with patch.object(check, "file_at_ref") as mock_ref:
+        assert check.private_registry_findings(["package-lock.json"], "main", []) == []
+        mock_ref.assert_not_called()
+
+
+def test_report_contains_fix_oneliner_and_urls() -> None:
+    findings = [{
+        "path": "package-lock.json",
+        "url": "https://sfw.semianalysis.com/npm/shell-quote/-/shell-quote-1.8.4.tgz",
+    }]
+    report = check.private_registry_report(findings)
+    assert "sed -i" in report
+    assert "registry.npmjs.org" in report
+    assert "shell-quote-1.8.4.tgz" in report
+    assert "replace-registry-host" in report

@@ -13,6 +13,10 @@ inputs:
     description: 'PR label that bypasses the check'
     required: false
     default: 'security/cooldown-override'
+  private_registry_hosts:
+    description: 'Comma-separated registry hosts that must never appear in committed lockfiles (fails the PR if introduced)'
+    required: false
+    default: 'sfw.semianalysis.com'
 runs:
   using: 'composite'
   steps:
@@ -34,6 +38,7 @@ runs:
         COOLDOWN_DAYS: ${{ inputs.cooldown_days }}
         ALLOWED_SCOPES: ${{ inputs.allowed_scopes }}
         OVERRIDE_LABEL: ${{ inputs.override_label }}
+        PRIVATE_REGISTRY_HOSTS: ${{ inputs.private_registry_hosts }}
         BASE_REF: ${{ github.event.pull_request.base.ref }}
         HEAD_REF: ${{ github.event.pull_request.head.ref }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
