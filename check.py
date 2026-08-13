@@ -4,11 +4,19 @@ Blocks PRs that introduce newly-published npm or PyPI packages younger than
 COOLDOWN_DAYS. Designed to catch supply-chain worms (Mini Shai-Hulud, etc.)
 where a malicious version is published and exfiltrates within hours of release.
 
+Also blocks PRs that introduce private-registry URLs (the org's Socket
+Firewall proxy, sfw.semianalysis.com) into committed lockfiles: those URLs
+401 for every environment without dev credentials (CI, Vercel, Dependabot),
+so lockfiles must stay canonical-public. Diff-based: pre-existing entries
+in a repo do not fail unrelated PRs.
+
 Inputs (via env vars):
   BASE_REF              git ref the PR is targeting (e.g. main)
   HEAD_REF              git ref of the PR head (current HEAD)
   COOLDOWN_DAYS         age threshold in days (default 7)
   ALLOWED_SCOPES        comma-separated npm scopes always allowed (e.g. @types,@vercel)
+  PRIVATE_REGISTRY_HOSTS comma-separated registry hosts that must never appear
+                        in lockfiles (default: sfw.semianalysis.com)
   OVERRIDE_LABEL        PR label that bypasses the check (default: security/cooldown-override)
   PR_LABELS             comma-separated labels currently on the PR
   GITHUB_OUTPUT         path GitHub Actions provides for setting outputs
@@ -106,6 +114,98 @@ def file_at_ref(ref: str, path: str) -> str | None:
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     return rc.stdout if rc.returncode == 0 else None
+
+
+# ----------------------------------------------------------------------------
+# Private-registry URLs in lockfiles (the sfw tripwire)
+# ----------------------------------------------------------------------------
+#
+# Dev/agent machines resolve through the org's Socket Firewall proxy; npm
+# records the resolving host into package-lock.json `resolved` fields (pnpm:
+# `tarball:`). Committed, those URLs 401 for every credential-less
+# environment: Dependabot ("can't authenticate to a private package
+# registry"), Vercel/CI (`npm ci` E401), and Bugbot flags them. The paved
+# road is a host-only rewrite back to the public registry — local installs
+# still transit the proxy via npm's default `replace-registry-host=npmjs`.
+# See PLAN_sfw_registry_architecture (kyle_local vault).
+
+DEFAULT_PRIVATE_REGISTRY_HOSTS = "sfw.semianalysis.com"
+
+# Lockfiles only: manifest files (package.json / pyproject.toml /
+# requirements*.txt) never carry resolved URLs, and scanning them would
+# false-positive on comments or documentation strings.
+LOCKFILE_NAMES = (
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+)
+
+
+def _private_registry_urls(text: str, hosts: list[str]) -> set[str]:
+    """Return every URL in `text` whose host portion matches one of `hosts`."""
+    if not text:
+        return set()
+    found: set[str] = set()
+    for host in hosts:
+        for m in re.finditer(
+            r"https?://" + re.escape(host) + r"(?::\d+)?[^\s\"']*", text
+        ):
+            found.add(m.group(0))
+    return found
+
+
+def private_registry_findings(
+    paths: list[str], base_ref: str, hosts: list[str]
+) -> list[dict[str, Any]]:
+    """Diff-based scan: URLs on private-registry hosts that this PR
+    *introduces* into lockfiles. Pre-existing entries (present at the
+    base ref) are not findings — the stock is cleaned separately; this
+    gates the delta."""
+    if not hosts:
+        return []
+    findings: list[dict[str, Any]] = []
+    for path in paths:
+        if path.rsplit("/", 1)[-1] not in LOCKFILE_NAMES:
+            continue
+        before = _private_registry_urls(file_at_ref(f"origin/{base_ref}", path) or "", hosts)
+        after = _private_registry_urls(file_at_ref("HEAD", path) or "", hosts)
+        for url in sorted(after - before):
+            findings.append({"path": path, "url": url})
+    return findings
+
+
+def private_registry_report(findings: list[dict[str, Any]]) -> str:
+    lines = [
+        "# \U0001f6a8 Private-registry URLs introduced into a lockfile",
+        "",
+        f"**{len(findings)} URL(s) on the org's Socket Firewall proxy were added to committed lockfiles.**",
+        "",
+        "These URLs require dev credentials and will **401 in every bot/CI "
+        "environment**: Dependabot update runs, Vercel builds, and bare "
+        "`npm ci`. Lockfiles must resolve to public registries; local "
+        "installs still route through the proxy via npm's default "
+        "`replace-registry-host` behavior, so this loses no protection.",
+        "",
+        "| File | URL |",
+        "|---|---|",
+    ]
+    for f in findings:
+        lines.append(f"| `{f['path']}` | `{f['url']}` |")
+    lines += [
+        "",
+        "## How to fix (host-only rewrite; integrity hashes unchanged)",
+        "",
+        "```bash",
+        r"sed -i 's|https://sfw\.semianalysis\.com\(:[0-9]*\)\?/npm/|https://registry.npmjs.org/|g' package-lock.json",
+        "```",
+        "",
+        "then commit the result. "
+        "_Generated by [supply-chain-guard](https://github.com/Semianalysis/supply-chain-guard)._",
+    ]
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------
@@ -607,8 +707,20 @@ def main() -> int:
     paths = changed_files(base_ref)
     log(f"[cooldown] changed dep files: {len(paths)}")
     if not paths:
-        write_summary("✅ No dependency files changed.")
+        write_summary("Γ£à No dependency files changed.")
         return 0
+
+    # Private-registry tripwire. Runs on every changed lockfile even when no
+    # package version changed: a host-only URL edit is exactly the diff shape
+    # this check exists to catch.
+    private_hosts = [
+        h.strip()
+        for h in env("PRIVATE_REGISTRY_HOSTS", DEFAULT_PRIVATE_REGISTRY_HOSTS).split(",")
+        if h.strip()
+    ]
+    registry_findings = private_registry_findings(paths, base_ref, private_hosts)
+    if registry_findings:
+        log(f"[registry] {len(registry_findings)} private-registry URL(s) introduced")
 
     # Build before/after package sets
     pairs: dict[str, dict[str, str]] = {}  # ecosystem -> {pkg: new_version}
@@ -627,7 +739,12 @@ def main() -> int:
         log(f"  {path} [{ecosystem}]: {len(after)-len(before):+d} new/changed entries")
 
     if not pairs:
-        write_summary("✅ Dependency files touched but no new or version-changed packages detected.")
+        if registry_findings:
+            report = private_registry_report(registry_findings)
+            write_summary(report)
+            post_pr_comment(report)
+            return 1
+        write_summary("Γ£à Dependency files touched but no new or version-changed packages detected.")
         return 0
 
     total_to_check = sum(len(v) for v in pairs.values())
@@ -639,9 +756,14 @@ def main() -> int:
     unresolved = [r for r in results if r.get("publish_time") is None and "skipped" not in r]
 
     if not young:
-        msg = (f"✅ {len(results)} new/changed package(s) checked, none younger than {cooldown_days} days. "
-               f"({len(unresolved)} could not be resolved against the registry — out of scope.)")
+        msg = (f"Γ£à {len(results)} new/changed package(s) checked, none younger than {cooldown_days} days. "
+               f"({len(unresolved)} could not be resolved against the registry ΓÇö out of scope.)")
         log(msg)
+        if registry_findings:
+            report = private_registry_report(registry_findings)
+            write_summary(msg + "\n\n" + report)
+            post_pr_comment(report)
+            return 1
         write_summary(msg)
         return 0
 
@@ -674,6 +796,8 @@ def main() -> int:
         f"_Generated by [supply-chain-guard](https://github.com/Semianalysis/supply-chain-guard)._",
     ]
     report = "\n".join(report_lines)
+    if registry_findings:
+        report += "\n\n" + private_registry_report(registry_findings)
 
     write_summary(report)
     post_pr_comment(report)
