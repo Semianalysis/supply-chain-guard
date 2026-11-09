@@ -21,16 +21,17 @@ runs:
   using: 'composite'
   steps:
     - name: Setup Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: '3.11'
 
     - name: Install resolver deps
+      # Pinned exactly (company 7-day rule: no unreviewed new versions).
       # `packaging` is required by check.py's pypi_resolve_spec_latest to
       # evaluate PEP 440 specifier sets. `npm` ships pre-installed on the
       # ubuntu-latest runner and powers the npm resolver.
       shell: bash
-      run: pip install --no-cache-dir 'packaging>=24,<26'
+      run: pip install --no-cache-dir 'packaging==25.0'
 
     - name: Run cooldown check
       shell: bash

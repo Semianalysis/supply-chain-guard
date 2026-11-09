@@ -10,14 +10,16 @@ Most supply-chain worms (Mini Shai-Hulud, Shai-Hulud, the original event-stream 
 
 The action runs on every PR (the workflow has no `paths:` filter — see the comment in `.github/workflows/cooldown.yml` for why). On PRs that don't touch a dependency file the job exits in seconds with a "no dependency files changed" pass.
 
-When a PR does touch a dep file (`package-lock.json`, `package.json`, `requirements.txt`, `pyproject.toml`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `yarn.lock`, `pnpm-lock.yaml`), the action:
+When a PR does touch a dep file (lockfiles: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `Cargo.lock`, `go.sum`; manifests: `package.json`, `pyproject.toml`, `requirements*.txt`), the action:
 
-1. Diffs the file against the PR's base branch.
-2. Identifies new or version-changed packages (direct + transitive).
-3. For each: queries the npm or PyPI registry for that version's publish time.
-4. Fails the check if any version is younger than the cooldown threshold.
+1. Diffs each lockfile against the PR's base branch and the merge base.
+2. Collects every (package, version) pair the lockfile resolves at the PR head that was not there before (direct and transitive, every copy).
+3. For each: queries the npm, PyPI, crates.io or Go module proxy registry for that version's publish time (3 tries per lookup).
+4. Fails the check if any version is younger than the cooldown threshold, **or if its publish date cannot be read** (fail closed; the report names each package).
 
-For unpinned ranges (e.g. `requests>=2.30` with no lockfile), the check resolves against the registry's **highest version that satisfies the spec** — the same version that would be installed at deploy time — and applies the age test to it.
+**Lockfile-first.** When a changed manifest has a lockfile in the same directory (or a parent lockfile that names the manifest's directory, as npm, pnpm, yarn, bun and uv workspaces do), only the lockfile-resolved versions are judged and the manifest's ranges are ignored. A range says nothing about what the build installs; judging it as its newest registry match produced false failures on Dependabot PRs. Range resolution (below) is the fallback for manifests with no lockfile.
+
+For unpinned ranges in a manifest with **no** lockfile (e.g. `requests>=2.30`), the check resolves against the registry's **highest version that satisfies the spec** (the same version that would be installed at deploy time) and applies the age test to it.
 
 This means a pin like `"@anthropic-ai/sdk": "^0.69.0"` resolves to the highest `0.69.x` published, not to whatever the registry currently tags as `latest`. Under semver-0 caret rules `^0.69.0` cannot resolve past `0.70.0`, so a fresh `1.0.0` published yesterday is irrelevant to the age check.
 
@@ -83,14 +85,19 @@ Then enable as a required status check on your protected branch.
 
 | Ecosystem | File | Mode |
 |---|---|---|
-| npm | `package-lock.json` (v2/v3) | exact-pinned, perfect diff |
-| npm | `package.json` (no lockfile) | range resolved to registry latest |
-| yarn | `yarn.lock` | TODO (not yet parsed) |
-| pnpm | `pnpm-lock.yaml` | TODO (not yet parsed) |
-| pypi | `uv.lock` | exact-pinned, perfect diff |
-| pypi | `poetry.lock` | exact-pinned, perfect diff |
-| pypi | `Pipfile.lock` | exact-pinned, perfect diff |
-| pypi | `requirements*.txt` | exact (if `==`) or range (resolved to registry latest) |
-| pypi | `pyproject.toml` | range resolved to registry latest |
+| npm | `package-lock.json`, `npm-shrinkwrap.json` (v1/v2/v3) | exact, every nested copy |
+| npm | `pnpm-lock.yaml` (v5/v6/v9) | exact |
+| npm | `yarn.lock` (classic and berry) | exact |
+| npm | `bun.lock` (text format) | exact |
+| npm | `package.json` | only when no lockfile covers it: range resolved to registry latest |
+| pypi | `uv.lock`, `poetry.lock`, `Pipfile.lock` | exact, PyPI-sourced packages only |
+| pypi | `requirements*.txt` | `==` pins exact; ranges only when no lockfile covers the file |
+| pypi | `pyproject.toml` | only when no lockfile covers it: range resolved to registry latest |
+| crates.io | `Cargo.lock` | exact, crates.io-sourced packages only |
+| go | `go.sum` | exact, module code lines only (`/go.mod`-only lines skipped) |
 
-If your repo uses an unsupported lockfile (yarn, pnpm), the action will silently skip those files for now. Open an issue and we'll add support.
+Entries from non-public sources (workspace links, git, local paths, private registries such as GitHub Packages or a private PyPI index, PyPI local versions like `+cu121`, `github.com/Semianalysis/...` Go modules) are skipped: they have no public publish date. The sfw proxy counts as public because it fronts the public registries.
+
+Lockfiles the action knows but cannot parse (`bun.lockb`, `Gemfile.lock`, `composer.lock` and similar) produce a warning in the summary, never a failure. A malformed lockfile does the same.
+
+PyPI publish time is the **newest** upload in the release: PyPI lets maintainers add files to an old release, and the newest file is what a late attack would add.
