@@ -20,6 +20,11 @@ Fail closed: a version whose publish date cannot be read after retries
 fails the check and is named in the report. The override label is the
 escape hatch. Lockfiles the check cannot parse give a warning, not a fail.
 
+Cooldown exceptions: exceptions.json next to this script (never the repo
+under check) can let one exact young version through until it is 7 days
+old, for urgent security fixes. Invalid, expired or integrity-mismatched
+entries are ignored and the normal cooldown applies.
+
 Inputs (via env vars):
   BASE_REF              git ref the PR is targeting (e.g. main)
   HEAD_REF              git ref of the PR head (current HEAD)
@@ -479,6 +484,14 @@ class LockResult:
     def __init__(self) -> None:
         self.pairs: set[tuple[str, str]] = set()
         self.skipped: list[str] = []
+        # (name, version) -> integrity strings the lockfile records for it
+        # (npm SRI form, e.g. "sha512-..."). Used to match cooldown exceptions.
+        self.integrity: dict[tuple[str, str], set[str]] = {}
+
+    def add(self, name: str, version: str, integrity: Any = None) -> None:
+        self.pairs.add((name, version))
+        if isinstance(integrity, str) and integrity.strip():
+            self.integrity.setdefault((name, version), set()).add(integrity.strip())
 
 
 NPM_PUBLIC_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com"}
@@ -495,6 +508,8 @@ GO_PRIVATE_PREFIXES = (
     "github.com/citrini-research/",
 )
 _SEMVERISH = re.compile(r"^v?\d+(\.\d+)*([\-+.][0-9A-Za-z.\-+]*)?$")
+# One Subresource Integrity token as npm records it: "<algorithm>-<base64>".
+_SRI_RE = re.compile(r"^(sha1|sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})$")
 
 
 def _pairs_to_dict(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
@@ -575,7 +590,7 @@ def lock_npm(text: str) -> LockResult:
             if not _npm_public(str(info.get("resolved") or "")):
                 out.skipped.append(f"{name}@{version} (non-public source)")
                 continue
-            out.pairs.add((name, version))
+            out.add(name, version, info.get("integrity"))
         return out
 
     def walk(deps: dict) -> None:
@@ -586,7 +601,7 @@ def lock_npm(text: str) -> LockResult:
             if info.get("bundled"):
                 out.skipped.append(f"{name} (bundled)")
             elif _semverish(version) and _npm_public(str(info.get("resolved") or "")):
-                out.pairs.add((name, version))
+                out.add(name, version, info.get("integrity"))
             else:
                 out.skipped.append(f"{name}@{version} (non-registry)")
             if isinstance(info.get("dependencies"), dict):
@@ -597,6 +612,9 @@ def lock_npm(text: str) -> LockResult:
     return out
 
 
+_PNPM_INTEGRITY_RE = re.compile(r"\bintegrity:\s*['\"]?([A-Za-z0-9]+-[A-Za-z0-9+/=]+)")
+
+
 def lock_pnpm(text: str) -> LockResult:
     """pnpm-lock.yaml v5, v6 and v9, read line by line (no YAML library)."""
     m = re.search(r"^lockfileVersion:\s*['\"]?(\d+)", text, re.MULTILINE)
@@ -605,15 +623,21 @@ def lock_pnpm(text: str) -> LockResult:
     major = int(m.group(1))
     out = LockResult()
     in_packages = False
+    current: tuple[str, str] | None = None  # the package block we are inside
     for line in text.splitlines():
         if line and not line[0].isspace():
             in_packages = line.rstrip() == "packages:"
+            current = None
             continue
         if not in_packages:
             continue
         km = re.match(r"^  (?! )(['\"]?)(.+?)\1:(\s|$)", line)
         if not km:
+            im = _PNPM_INTEGRITY_RE.search(line)
+            if current is not None and im:
+                out.add(current[0], current[1], im.group(1))
             continue
+        current = None
         key = km.group(2).split("(", 1)[0]  # v6/v9 peer suffix
         if major <= 5:
             if not key.startswith("/"):
@@ -637,7 +661,8 @@ def lock_pnpm(text: str) -> LockResult:
         if not _semverish(version):
             out.skipped.append(key)
             continue
-        out.pairs.add((name, version))
+        out.add(name, version)
+        current = (name, version)
     return out
 
 
@@ -689,7 +714,9 @@ def lock_yarn(text: str) -> LockResult:
         if not _semverish(version):
             out.skipped.append(f"{header} (version {version!r})")
             continue
-        out.pairs.add((name, version))
+        # Classic records the npm SRI integrity. Berry's `checksum` is yarn's
+        # own cache hash, which is not comparable with the registry integrity.
+        out.add(name, version, None if berry else body.get("integrity"))
     return out
 
 
@@ -747,7 +774,8 @@ def lock_bun(text: str) -> LockResult:
         if registry and not _npm_public(registry):
             out.skipped.append(f"{entry[0]} (non-public source)")
             continue
-        out.pairs.add(split)
+        integrity = next((e for e in entry[1:] if isinstance(e, str) and _SRI_RE.match(e)), None)
+        out.add(split[0], split[1], integrity)
     return out
 
 
@@ -1259,6 +1287,222 @@ def age_check_packages(
 
 
 # ----------------------------------------------------------------------------
+# Cooldown exceptions (fast lane for urgent security fixes)
+# ----------------------------------------------------------------------------
+#
+# exceptions.json lives next to this script, in the action's own checkout of
+# this repo (the org workflow pins the action to @main). It is never read from
+# the repo under check or the working directory: a PR must not be able to
+# grant itself an exception.
+#
+# An entry lets one exact young version through until `expires`, which is the
+# version's publish time plus 7 days. Anything wrong with the file or an entry
+# means that entry (or the whole file) is ignored, so the normal cooldown
+# applies (fail closed).
+
+EXCEPTIONS_PATH = Path(__file__).resolve().parent / "exceptions.json"
+EXCEPTION_ECOSYSTEMS = frozenset({"npm", "pypi", "cargo", "go", "rubygems", "packagist"})
+# check.py's internal ecosystem names -> exceptions.json ecosystem names.
+_EXCEPTION_ECO = {"npm": "npm", "npm-spec": "npm", "pypi": "pypi", "pypi-spec": "pypi",
+                  "cargo": "cargo", "go": "go"}
+EXCEPTION_MAX_DAYS = 8
+_EXACT_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+_!\-]*$")
+_WILDCARD_PART_RE = re.compile(r"(^|\.)[xX](\.|$)")
+
+
+class ExceptionSet:
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []   # valid and not expired
+        self.ignored: list[tuple[str, str]] = []  # (label, reason)
+        self.warnings: list[str] = []             # file or entry problems
+
+
+def _exception_pkg_key(ecosystem: str, name: str) -> str:
+    return _pypi_norm(name) if ecosystem == "pypi" else name
+
+
+def _exception_ts(value: Any) -> dt.datetime | None:
+    """Timezone-aware ISO 8601 timestamp, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _safe(value: Any, limit: int = 100) -> str:
+    """Entry text made safe for one line of markdown."""
+    return re.sub(r"[^\w.@/+!:#\- ]", "?", str(value))[:limit]
+
+
+def _exception_label(raw: Any, index: int) -> str:
+    if not isinstance(raw, dict):
+        return f"entry {index}"
+    return (f"{_safe(raw.get('id', '?'))} ({_safe(raw.get('ecosystem', '?'))} "
+            f"{_safe(raw.get('package', '?'))} {_safe(raw.get('version', '?'))})")
+
+
+def _validate_exception(raw: Any, now: dt.datetime) -> tuple[dict[str, Any] | None, str, bool]:
+    """(entry, reason, invalid). entry is None when the exception does not apply."""
+    if not isinstance(raw, dict):
+        return None, "entry is not an object", True
+    for field in ("id", "ecosystem", "package", "version", "approved_by", "request"):
+        if not isinstance(raw.get(field), str) or not raw[field].strip():
+            return None, f"`{field}` missing or empty", True
+    eco = raw["ecosystem"]
+    if eco not in EXCEPTION_ECOSYSTEMS:
+        return None, f"unknown ecosystem {_safe(eco)!r}", True
+    version = raw["version"]
+    if not _EXACT_VERSION_RE.match(version) or _WILDCARD_PART_RE.search(version):
+        return None, "version is not one exact version", True
+    integrity = raw.get("integrity")
+    if integrity is not None and (not isinstance(integrity, str) or not _SRI_RE.match(integrity)):
+        return None, "integrity is not null or one `<sha>-<base64>` value", True
+    if "@" in raw["approved_by"]:
+        return None, "approved_by must be a display name, not an email address", True
+    published = _exception_ts(raw.get("published_at"))
+    expires = _exception_ts(raw.get("expires"))
+    if published is None or expires is None or _exception_ts(raw.get("approved_at")) is None:
+        return None, "published_at, expires and approved_at must be ISO 8601 times with a time zone", True
+    limit = dt.timedelta(days=EXCEPTION_MAX_DAYS)
+    if expires <= published:
+        return None, "expires is not after published_at", True
+    if expires > published + limit:
+        return None, f"expires is more than {EXCEPTION_MAX_DAYS} days after published_at", True
+    if expires > now + limit:
+        return None, f"expires is more than {EXCEPTION_MAX_DAYS} days from now", True
+    if now >= expires:
+        return None, f"expired {expires.astimezone(dt.timezone.utc):%Y-%m-%d %H:%M} UTC", False
+    return {
+        "id": raw["id"].strip(), "ecosystem": eco, "package": raw["package"],
+        "key": _exception_pkg_key(eco, raw["package"]), "version": version,
+        "integrity": integrity, "expires": expires, "approved_by": raw["approved_by"].strip(),
+    }, "", False
+
+
+def load_exceptions(path: Path | str | None = None, now: dt.datetime | None = None) -> ExceptionSet:
+    """Read and validate exceptions.json. Never raises: any problem means no
+    exception from the bad part applies, plus a warning."""
+    path = Path(path) if path is not None else EXCEPTIONS_PATH
+    now = now or dt.datetime.now(dt.timezone.utc)
+    out = ExceptionSet()
+    try:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            log(f"[exceptions] {path} not found; no cooldown exceptions")
+            return out
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            out.warnings.append(f"exceptions.json is not valid JSON ({e}); no cooldown exceptions apply.")
+            return out
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+            out.warnings.append("exceptions.json is not `version: 1`; no cooldown exceptions apply.")
+            return out
+        entries = data.get("exceptions")
+        if not isinstance(entries, list):
+            out.warnings.append("exceptions.json has no `exceptions` list; no cooldown exceptions apply.")
+            return out
+        for index, raw in enumerate(entries):
+            label = _exception_label(raw, index)
+            try:
+                entry, reason, invalid = _validate_exception(raw, now)
+            except Exception as e:  # a strange entry must never crash the check
+                entry, reason, invalid = None, f"unreadable ({type(e).__name__})", True
+            if entry is not None:
+                out.entries.append(entry)
+                continue
+            out.ignored.append((label, reason))
+            if invalid:
+                out.warnings.append(f"Cooldown exception {label} ignored: {reason}.")
+    except Exception as e:
+        out = ExceptionSet()
+        out.warnings.append(f"exceptions.json could not be read ({type(e).__name__}: {e}); "
+                            "no cooldown exceptions apply.")
+    return out
+
+
+def _integrity_ok(expected: str | None, lock_values: Iterable[str]) -> bool:
+    """True unless the lockfile records an integrity of the same algorithm
+    that differs from the exception's."""
+    if expected is None:
+        return True
+    alg, digest = expected.split("-", 1)
+    seen = {token[len(alg) + 1:]
+            for value in lock_values for token in value.split()
+            if token.startswith(alg + "-")}
+    return not seen or seen == {digest}
+
+
+def apply_exceptions(
+    young: list[dict[str, Any]],
+    exceptions: ExceptionSet,
+    integrity: dict[tuple[str, str, str], set[str]],
+) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]]]:
+    """Split young results into (still young, [(result, exception used)]).
+
+    A young version passes only on an entry with the same ecosystem, package
+    (PEP 503 normalized for PyPI) and exact version, whose integrity (when
+    set) agrees with every same-algorithm integrity in the lockfiles.
+    Integrity mismatches are added to exceptions.ignored."""
+    still: list[dict[str, Any]] = []
+    used: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for r in young:
+        eco = _EXCEPTION_ECO.get(r.get("ecosystem", ""))
+        version = r.get("resolved") or r.get("version")
+        if eco is None or not version:
+            still.append(r)
+            continue
+        key = _exception_pkg_key(eco, r["pkg"])
+        candidates = [e for e in exceptions.entries
+                      if e["ecosystem"] == eco and e["key"] == key and e["version"] == version]
+        lock_values = integrity.get((r["ecosystem"], r["pkg"], r.get("version", "")), set())
+        match = next((e for e in candidates if _integrity_ok(e["integrity"], lock_values)), None)
+        if match is not None:
+            used.append((r, match))
+            continue
+        for e in candidates:
+            label = f"{_safe(e['id'])} ({eco} {_safe(e['package'])} {_safe(e['version'])})"
+            reason = "integrity differs from the lockfile"
+            exceptions.ignored.append((label, reason))
+            exceptions.warnings.append(f"Cooldown exception {label} ignored: {reason}.")
+        still.append(r)
+    return still, used
+
+
+def exceptions_report(used: list[tuple[dict[str, Any], dict[str, Any]]], exceptions: ExceptionSet) -> str:
+    if not used and not exceptions.ignored and not exceptions.warnings:
+        return ""
+    lines = ["### Cooldown exceptions", ""]
+    if used:
+        lines += [
+            "These young versions passed on an approved exception (exact version, until it is 7 days old):",
+            "",
+            "| Ecosystem | Package | Version | Advisory | Approved by | Expires (UTC) |",
+            "|---|---|---|---|---|---|",
+        ]
+        for r, e in sorted(used, key=lambda u: (u[1]["ecosystem"], u[0]["pkg"])):
+            lines.append(
+                f"| {e['ecosystem']} | `{_safe(r['pkg'])}` | `{_safe(r.get('resolved') or r['version'])}` "
+                f"| {_safe(e['id'])} | {_safe(e['approved_by'])} "
+                f"| {e['expires'].astimezone(dt.timezone.utc):%Y-%m-%d %H:%M} |"
+            )
+        lines.append("")
+    if exceptions.ignored:
+        lines += ["Exception entries not used (the normal cooldown applies):", ""]
+        lines += [f"- {label}: {reason}" for label, reason in exceptions.ignored]
+        lines.append("")
+    file_warnings = [w for w in exceptions.warnings if w.startswith("exceptions.json")]
+    if file_warnings:
+        lines += [f"- {w}" for w in file_warnings]
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -1311,7 +1555,8 @@ def main() -> int:
     # resolves to its newest registry match, as before.
     merge_base = merge_base_ref(base_ref)
     old_refs = [f"origin/{base_ref}"] + ([merge_base] if merge_base else [])
-    pairs, lockfile_warnings = collect_pairs(paths, old_refs)
+    integrity: dict[tuple[str, str, str], set[str]] = {}
+    pairs, lockfile_warnings = collect_pairs(paths, old_refs, integrity)
     lockfile_warnings += [
         f"`{p}` changed, but this lockfile format is not parsed: package ages NOT checked."
         for p in changed_unparsed_lockfiles(base_ref)
@@ -1337,15 +1582,31 @@ def main() -> int:
     young = [r for r in results if r.get("young")]
     unresolved = [r for r in results if r.get("unresolved")]
 
+    # Cooldown exceptions: exact, unexpired, approved versions pass. Every
+    # other young version still fails. Unresolved versions are never excepted.
+    exceptions = load_exceptions()
+    young, used_exceptions = apply_exceptions(young, exceptions, integrity)
+    for w in exceptions.warnings:
+        print(f"::warning::{w}", flush=True)
+    for r, e in used_exceptions:
+        log(f"[exceptions] {r['ecosystem']} {r['pkg']}@{r.get('resolved') or r['version']} "
+            f"allowed by {e['id']} (expires {e['expires'].isoformat()})")
+    show_exceptions = bool(used_exceptions or young or exceptions.warnings)
+    exceptions_md = exceptions_report(used_exceptions, exceptions) if show_exceptions else ""
+    exceptions_md = ("\n\n" + exceptions_md) if exceptions_md else ""
+
     if not young and not unresolved:
         msg = f"✅ {len(results)} new/changed package(s) checked, none younger than {cooldown_days} days."
+        if used_exceptions:
+            msg = (f"✅ {len(results)} new/changed package(s) checked. {len(used_exceptions)} young "
+                   f"version(s) allowed by a cooldown exception; none other younger than {cooldown_days} days.")
         log(msg)
         if registry_findings:
             report = private_registry_report(registry_findings)
-            write_summary(msg + "\n\n" + report + warnings_md)
+            write_summary(msg + exceptions_md + "\n\n" + report + warnings_md)
             post_pr_comment(report)
             return 1
-        write_summary(msg + warnings_md)
+        write_summary(msg + exceptions_md + warnings_md)
         return 0
 
     # We have a finding. Build the report.
@@ -1394,7 +1655,7 @@ def main() -> int:
         f"",
         f"_Generated by [supply-chain-guard](https://github.com/Semianalysis/supply-chain-guard)._",
     ]
-    report = "\n".join(report_lines)
+    report = "\n".join(report_lines) + exceptions_md
     if registry_findings:
         report += "\n\n" + private_registry_report(registry_findings)
 
@@ -1403,9 +1664,17 @@ def main() -> int:
     return 1
 
 
-def collect_pairs(paths: list[str], old_refs: list[str]) -> tuple[dict[str, Any], list[str]]:
+def collect_pairs(
+    paths: list[str],
+    old_refs: list[str],
+    integrity: dict[tuple[str, str, str], set[str]] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     """ecosystem -> new pairs (set of (pkg, version)) or {pkg: spec} for
-    manifest ranges, plus warnings for files that could not be parsed."""
+    manifest ranges, plus warnings for files that could not be parsed.
+
+    When `integrity` is given, it is filled with
+    (ecosystem, pkg, version) -> integrity strings the HEAD lockfiles record
+    for each new pair (used to match cooldown exceptions)."""
     pairs: dict[str, Any] = {}
     warnings: list[str] = []
     for path in paths:
@@ -1436,6 +1705,10 @@ def collect_pairs(paths: list[str], old_refs: list[str]) -> tuple[dict[str, Any]
             new = after.pairs - before
             if new:
                 pairs.setdefault(eco, set()).update(new)
+                if integrity is not None:
+                    for pair in new:
+                        if pair in after.integrity:
+                            integrity.setdefault((eco, *pair), set()).update(after.integrity[pair])
             log(f"  {path} [{eco}]: {len(new)} new version(s), {len(after.skipped)} non-registry entr(y/ies) skipped")
 
         # 2. Manifest ranges, only when no lockfile resolves them.
