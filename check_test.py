@@ -1005,3 +1005,260 @@ def test_main_warns_but_passes_on_unparsed_lockfile(tmp_path) -> None:
             patch.object(check, "changed_unparsed_lockfiles", return_value=["Gemfile.lock"]):
         assert _run_main({("HEAD", "go.sum"): ""}, ["go.sum"]) == 0
     assert "Gemfile.lock" in summary.read_text(encoding="utf-8")
+
+
+# --- cooldown exceptions -------------------------------------------------------
+#
+# exceptions.json (next to check.py, never the repo under check) lets one
+# exact young version through until it is 7 days old. Everything else about
+# the PR is still checked. Bad entries are ignored: the cooldown applies.
+
+import datetime as dt  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+NOW = dt.datetime.now(dt.timezone.utc)
+SHA_A = "sha512-" + "A" * 86 + "=="
+SHA_B = "sha512-" + "B" * 86 + "=="
+
+
+def _iso(t: dt.datetime) -> str:
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _entry(**overrides) -> dict:
+    published = NOW - dt.timedelta(days=1)
+    entry = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "ecosystem": "npm",
+        "package": "next",
+        "version": "16.4.3",
+        "integrity": SHA_A,
+        "published_at": _iso(published),
+        "expires": _iso(published + dt.timedelta(days=7)),
+        "approved_by": "Test Approver",
+        "approved_at": _iso(NOW - dt.timedelta(hours=2)),
+        "request": "example#1",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _write_exceptions(directory, entries, version=1) -> Path:
+    path = Path(directory) / "exceptions.json"
+    path.write_text(json.dumps({"version": version, "exceptions": entries}), encoding="utf-8")
+    return path
+
+
+def _young(eco, pkg, ver):
+    """lookup_publish_time stand-in: every version is one day old."""
+    return ver, NOW - dt.timedelta(days=1)
+
+
+def _npm_lock(entries: dict) -> str:
+    packages: dict = {"": {"name": "app"}}
+    for name, (version, integrity) in entries.items():
+        info = {"version": version, "resolved": f"https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"}
+        if integrity:
+            info["integrity"] = integrity
+        packages[f"node_modules/{name}"] = info
+    return json.dumps({"lockfileVersion": 3, "packages": packages})
+
+
+@contextmanager
+def _main_patches(files, changed, lookup=_young, exceptions_path=None):
+    with _refs(files), \
+            patch.object(check, "changed_files", return_value=changed), \
+            patch.object(check, "_changed_paths", return_value=changed), \
+            patch.object(check, "merge_base_ref", return_value=None), \
+            patch.object(check, "live_pr_labels", return_value=set()), \
+            patch.object(check, "lookup_publish_time", side_effect=lookup):
+        if exceptions_path is None:
+            yield
+        else:
+            with patch.object(check, "EXCEPTIONS_PATH", Path(exceptions_path)):
+                yield
+
+
+def _run_main_with_exceptions(files, changed, exceptions_path):
+    with _main_patches(files, changed, exceptions_path=exceptions_path):
+        return check.main()
+
+
+def test_repo_exceptions_file_is_valid() -> None:
+    data = json.loads(check.EXCEPTIONS_PATH.read_text(encoding="utf-8"))
+    assert data["version"] == 1 and isinstance(data["exceptions"], list)
+    assert check.load_exceptions().warnings == []  # expired entries are fine, invalid ones are not
+
+
+def test_parsers_keep_npm_integrity() -> None:
+    lock = check.lock_npm(_npm_lock({"next": ("16.4.3", SHA_A)}))
+    assert lock.integrity == {("next", "16.4.3"): {SHA_A}}
+    assert check.lock_pnpm(PNPM_V9).integrity[("next", "16.4.3")] == {"sha512-bbb"}
+    assert check.lock_pnpm(PNPM_V5).integrity[("@next/env", "12.3.4")] == {"sha512-aaa"}
+    assert check.lock_yarn(YARN_CLASSIC).integrity == {("@babel/core", "7.26.10"): {"sha512-aaa"}}
+    assert check.lock_yarn(YARN_BERRY).integrity == {}
+    assert check.lock_bun(BUN_LOCK).integrity[("next", "16.4.3")] == {"sha512-bbb"}
+
+
+def test_exact_match_passes(tmp_path) -> None:
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A)})}
+    exc = _write_exceptions(tmp_path, [_entry()])
+    with _main_env(tmp_path) as summary:
+        assert _run_main_with_exceptions(files, ["package-lock.json"], exc) == 0
+    text = summary.read_text(encoding="utf-8")
+    assert "GHSA-aaaa-bbbb-cccc" in text and "Test Approver" in text and "`next`" in text
+
+
+def test_other_young_deps_in_same_pr_still_fail(tmp_path) -> None:
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A), "left-pad": ("1.3.1", None)})}
+    exc = _write_exceptions(tmp_path, [_entry()])
+    with _main_env(tmp_path) as summary:
+        assert _run_main_with_exceptions(files, ["package-lock.json"], exc) == 1
+    text = summary.read_text(encoding="utf-8")
+    assert "**1 package(s) below" in text and "`left-pad`" in text
+    assert "GHSA-aaaa-bbbb-cccc" in text  # the used exception is still listed
+
+
+def test_exception_for_another_version_does_not_apply(tmp_path) -> None:
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.4", None)})}
+    exc = _write_exceptions(tmp_path, [_entry()])
+    with _main_env(tmp_path):
+        assert _run_main_with_exceptions(files, ["package-lock.json"], exc) == 1
+
+
+def test_expired_entry_is_ignored(tmp_path) -> None:
+    published = NOW - dt.timedelta(days=7, hours=1)
+    entry = _entry(published_at=_iso(published), expires=_iso(published + dt.timedelta(days=7)))
+    exc = _write_exceptions(tmp_path, [entry])
+    loaded = check.load_exceptions(exc, now=NOW)
+    assert loaded.entries == []
+    assert "expired" in loaded.ignored[0][1]
+    assert loaded.warnings == []  # expiry is normal, not a file problem
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A)})}
+    with _main_env(tmp_path) as summary:
+        assert _run_main_with_exceptions(files, ["package-lock.json"], exc) == 1
+    assert "expired" in summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "published_days_ago, expires_after_published_days",
+    [
+        (1, 9),   # expires more than 8 days after published_at
+        (-2, 7),  # published_at in the future: expires more than 8 days from now
+    ],
+)
+def test_expires_too_far_out_is_invalid(tmp_path, published_days_ago, expires_after_published_days) -> None:
+    published = NOW - dt.timedelta(days=published_days_ago)
+    entry = _entry(published_at=_iso(published),
+                   expires=_iso(published + dt.timedelta(days=expires_after_published_days)))
+    loaded = check.load_exceptions(_write_exceptions(tmp_path, [entry]), now=NOW)
+    assert loaded.entries == []
+    assert "more than 8 days" in loaded.ignored[0][1]
+    assert len(loaded.warnings) == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"version": "^16.4.3"},
+        {"version": "16.x"},
+        {"version": ">=16.4.3"},
+        {"ecosystem": "maven"},
+        {"package": ""},
+        {"integrity": "md5-abc"},
+        {"approved_by": "someone@example.com"},
+        {"expires": "2026-11-12"},  # no time zone
+        {"published_at": None},
+        {"request": None},
+    ],
+)
+def test_bad_entries_are_ignored(tmp_path, overrides) -> None:
+    good = _entry(package="other")
+    loaded = check.load_exceptions(_write_exceptions(tmp_path, [_entry(**overrides), good]), now=NOW)
+    assert [e["package"] for e in loaded.entries] == ["other"]  # one bad entry does not sink the file
+    assert len(loaded.ignored) == 1 and len(loaded.warnings) == 1
+
+
+def test_integrity_mismatch_blocks_the_exception(tmp_path) -> None:
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_B)})}
+    exc = _write_exceptions(tmp_path, [_entry()])
+    with _main_env(tmp_path) as summary:
+        assert _run_main_with_exceptions(files, ["package-lock.json"], exc) == 1
+    assert "integrity differs" in summary.read_text(encoding="utf-8")
+
+
+def test_integrity_of_another_algorithm_is_not_compared() -> None:
+    assert check._integrity_ok(SHA_A, {"sha1-abc="}) is True
+    assert check._integrity_ok(SHA_A, set()) is True
+    assert check._integrity_ok(SHA_A, {f"{SHA_A} sha1-abc="}) is True
+    assert check._integrity_ok(SHA_A, {SHA_A, SHA_B}) is False  # two copies, one differs
+    assert check._integrity_ok(None, {SHA_B}) is True
+
+
+def test_pypi_names_are_normalized(tmp_path) -> None:
+    files = {("HEAD", "requirements.txt"): "Zope.Interface==7.2\n"}
+    entry = _entry(ecosystem="pypi", package="zope_interface", version="7.2", integrity=None)
+    exc = _write_exceptions(tmp_path, [entry])
+    with _main_env(tmp_path):
+        assert _run_main_with_exceptions(files, ["requirements.txt"], exc) == 0
+    # The same name under another ecosystem is a different package.
+    exc = _write_exceptions(tmp_path, [dict(entry, ecosystem="npm")])
+    with _main_env(tmp_path):
+        assert _run_main_with_exceptions(files, ["requirements.txt"], exc) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        "[]",
+        json.dumps({"version": 2, "exceptions": [_entry()]}),
+        json.dumps({"version": True, "exceptions": [_entry()]}),
+        json.dumps({"version": 1, "exceptions": {"a": _entry()}}),
+        json.dumps({"version": 1, "exceptions": [_entry(), "junk", None, 5]}),
+    ],
+)
+def test_malformed_file_never_crashes_and_never_passes_extra(tmp_path, content) -> None:
+    path = tmp_path / "exceptions.json"
+    path.write_text(content, encoding="utf-8")
+    loaded = check.load_exceptions(path, now=NOW)
+    assert loaded.warnings  # always explained
+    if "junk" not in content:
+        assert loaded.entries == []
+    # left-pad has no exception in any variant, so the PR fails either way.
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A), "left-pad": ("1.3.1", None)})}
+    with _main_env(tmp_path):
+        assert _run_main_with_exceptions(files, ["package-lock.json"], path) == 1
+
+
+def test_unreadable_file_means_no_exceptions(tmp_path) -> None:
+    path = tmp_path / "exceptions.json"
+    path.write_bytes(b"\xff\xfe\x00garbage")
+    loaded = check.load_exceptions(path, now=NOW)
+    assert loaded.entries == [] and loaded.warnings
+
+
+def test_missing_file_means_no_exceptions(tmp_path) -> None:
+    loaded = check.load_exceptions(tmp_path / "absent.json", now=NOW)
+    assert loaded.entries == [] and loaded.warnings == []
+
+
+def test_caller_repo_cannot_supply_its_own_exceptions(tmp_path, monkeypatch) -> None:
+    # The file is read from the action's own directory, never the working
+    # directory (the checked-out repo under review).
+    assert check.EXCEPTIONS_PATH == Path(check.__file__).resolve().parent / "exceptions.json"
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    _write_exceptions(caller, [_entry()])
+    monkeypatch.chdir(caller)
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A)})}
+    with _main_env(tmp_path), _main_patches(files, ["package-lock.json"]):
+        assert check.main() == 1  # the action's own exceptions.json (empty) is used
+
+
+def test_unresolved_versions_are_never_excepted(tmp_path) -> None:
+    files = {("HEAD", "package-lock.json"): _npm_lock({"next": ("16.4.3", SHA_A)})}
+    exc = _write_exceptions(tmp_path, [_entry()])
+    with _main_env(tmp_path), \
+            _main_patches(files, ["package-lock.json"], lookup=lambda e, p, v: (v, None), exceptions_path=exc):
+        assert check.main() == 1

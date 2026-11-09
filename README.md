@@ -54,6 +54,46 @@ Add the `security/cooldown-override` label to a PR to bypass the check after man
 
 The label is read **live from the GitHub API** at check time (in addition to the event payload), so it takes effect the moment it's on the PR — you do **not** need to push a new commit or re-run the job. (Historically the action only read `github.event.pull_request.labels`, which is a snapshot frozen when the triggering event fired; a label added afterwards was invisible, and "Re-run jobs" replays the original payload rather than refreshing it, so retries never picked it up.) If a stale run is still showing red, a fresh run — via a new push or the "Re-run" button — will now re-read the current labels and pass.
 
+## Cooldown exceptions (security fast lane)
+
+Sometimes a critical or exploited advisory needs its fix merged before the fixed version is 7 days old. A cooldown exception allows that for one exact package version, for a short time.
+
+**What an exception is.** An entry in `exceptions.json` at the root of this repo:
+
+```json
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "id": "GHSA-xxxx-xxxx-xxxx",
+      "ecosystem": "npm",
+      "package": "example-pkg",
+      "version": "1.2.3",
+      "integrity": "sha512-...",
+      "published_at": "2026-10-15T18:00:00Z",
+      "expires": "2026-10-22T18:00:00Z",
+      "approved_by": "Approver Name",
+      "approved_at": "2026-10-16T09:00:00Z",
+      "request": "..."
+    }
+  ]
+}
+```
+
+A young version passes the check only when all of these are true:
+
+- Same ecosystem (`npm`, `pypi`, `cargo`, `go`, `rubygems`, `packagist`), same package, same exact version. PyPI names are compared after PEP 503 normalization.
+- The entry is valid and not expired.
+- If the entry has an `integrity` and the lockfile records an integrity of the same algorithm (npm `package-lock.json`, `pnpm-lock.yaml`, classic `yarn.lock` and `bun.lock` record `sha512`), the two are equal.
+
+Other young versions in the same PR still fail. The check summary lists every exception it used and every entry it ignored.
+
+**Who approves.** A member of the Entra "IT Team" group, with one click on an approval button that an internal bot posts in Slack. The bot then adds the entry to this file with a PR that it merges at once. Nobody adds entries by hand.
+
+**Entries expire at 7 days.** `expires` is the version's publish time plus 7 days, which is when the version passes the normal cooldown anyway. An entry whose `expires` is more than 8 days after `published_at`, or more than 8 days from now, is invalid.
+
+**Fail closed.** The file is read from this action's own copy of the repo, never from the repo under check, so a PR cannot grant itself an exception. A malformed file, a wrong `version`, or a bad entry (a range instead of one version, an unknown ecosystem, a missing time zone, an email address in `approved_by`) is ignored with a warning, and the normal cooldown applies. Versions whose publish date cannot be read are never excepted.
+
 ## Allowlist
 
 Trusted scopes can be pre-allowed via the `allowed_scopes` input. Default: `@types`. Add others (e.g. `@vercel`, `@radix-ui`) by passing the input when calling the workflow.
