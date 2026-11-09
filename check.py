@@ -10,6 +10,16 @@ Firewall proxy, sfw.semianalysis.com) into committed lockfiles: those URLs
 so lockfiles must stay canonical-public. Diff-based: pre-existing entries
 in a repo do not fail unrelated PRs.
 
+Lockfile-first: when a changed manifest (package.json, pyproject.toml, a
+requirements file's ranges) has a lockfile in its directory (or a parent
+lockfile that names its directory, as workspaces do), only the
+lockfile-resolved versions are judged. Range resolution against the
+registry is the fallback for manifests with no lockfile at all.
+
+Fail closed: a version whose publish date cannot be read after retries
+fails the check and is named in the report. The override label is the
+escape hatch. Lockfiles the check cannot parse give a warning, not a fail.
+
 Inputs (via env vars):
   BASE_REF              git ref the PR is targeting (e.g. main)
   HEAD_REF              git ref of the PR head (current HEAD)
@@ -38,16 +48,26 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
+import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import urlparse
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 PYPI_REGISTRY = "https://pypi.org/pypi"
+CRATES_API = "https://crates.io/api/v1/crates"
+GO_PROXY = "https://proxy.golang.org"
 USER_AGENT = "semianalysis-cooldown-check/1.0"
+
+FETCH_ATTEMPTS = 3
+FETCH_BACKOFF_SECONDS = 2.0
 
 
 def env(name: str, default: str = "") -> str:
@@ -58,17 +78,46 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def fetch_json(url: str) -> dict[str, Any] | None:
+_fetch_cache: dict[str, dict[str, Any] | None] = {}
+_fetch_lock = threading.Lock()
+_crates_lock = threading.Lock()
+
+
+def _fetch_once(url: str) -> dict[str, Any]:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        log(f"  fetch {url}: HTTP {e.code}")
-        return None
-    except Exception as e:
-        log(f"  fetch {url}: {e}")
-        return None
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_json(url: str) -> dict[str, Any] | None:
+    """GET JSON with retries and a per-run cache. None after the last failed attempt.
+
+    A None publish date is a FAIL in the PR check (fail closed), so a
+    transient registry error gets FETCH_ATTEMPTS tries before that happens.
+    """
+    with _fetch_lock:
+        if url in _fetch_cache:
+            return _fetch_cache[url]
+    data: dict[str, Any] | None = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            if url.startswith(CRATES_API):
+                # crates.io asks API clients for at most one request per second.
+                with _crates_lock:
+                    time.sleep(1.0)
+                    data = _fetch_once(url)
+            else:
+                data = _fetch_once(url)
+            break
+        except urllib.error.HTTPError as e:
+            log(f"  fetch {url}: HTTP {e.code} (attempt {attempt}/{FETCH_ATTEMPTS})")
+        except Exception as e:
+            log(f"  fetch {url}: {e} (attempt {attempt}/{FETCH_ATTEMPTS})")
+        if attempt < FETCH_ATTEMPTS:
+            time.sleep(FETCH_BACKOFF_SECONDS * attempt)
+    with _fetch_lock:
+        _fetch_cache[url] = data
+    return data
 
 
 # ----------------------------------------------------------------------------
@@ -77,9 +126,11 @@ def fetch_json(url: str) -> dict[str, Any] | None:
 
 DEP_FILE_PATTERNS = (
     "package-lock.json",
+    "npm-shrinkwrap.json",
     "package.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
     "requirements.txt",
     "requirements-dev.txt",
     "requirements-test.txt",
@@ -87,11 +138,31 @@ DEP_FILE_PATTERNS = (
     "Pipfile.lock",
     "poetry.lock",
     "uv.lock",
+    "Cargo.lock",
+    "go.sum",
+)
+
+# Lockfiles this check knows about but cannot read. A change to one is a
+# warning in the summary (never a failure).
+UNPARSED_LOCKFILES = (
+    "bun.lockb",
+    "Gemfile.lock",
+    "composer.lock",
+    "mix.lock",
+    "pubspec.lock",
+    "Package.resolved",
+    "gradle.lockfile",
+    "packages.lock.json",
+    "pdm.lock",
+    "pixi.lock",
 )
 
 
-def changed_files(base_ref: str) -> list[str]:
-    """Files changed in this PR relative to base_ref."""
+def _is_dep_file(name: str) -> bool:
+    return name in DEP_FILE_PATTERNS or (name.startswith("requirements") and name.endswith(".txt"))
+
+
+def _changed_paths(base_ref: str) -> list[str]:
     rc = subprocess.run(
         ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -99,12 +170,27 @@ def changed_files(base_ref: str) -> list[str]:
     if rc.returncode != 0:
         log(f"  git diff failed: {rc.stderr}")
         return []
-    paths = []
-    for line in rc.stdout.splitlines():
-        name = line.strip().rsplit("/", 1)[-1]
-        if name in DEP_FILE_PATTERNS or name.startswith("requirements") and name.endswith(".txt"):
-            paths.append(line.strip())
-    return paths
+    return [line.strip() for line in rc.stdout.splitlines() if line.strip()]
+
+
+def changed_files(base_ref: str) -> list[str]:
+    """Dependency files changed in this PR relative to base_ref."""
+    return [p for p in _changed_paths(base_ref) if _is_dep_file(p.rsplit("/", 1)[-1])]
+
+
+def changed_unparsed_lockfiles(base_ref: str) -> list[str]:
+    return [p for p in _changed_paths(base_ref) if p.rsplit("/", 1)[-1] in UNPARSED_LOCKFILES]
+
+
+def merge_base_ref(base_ref: str) -> str | None:
+    """Commit where the PR branched from base. Lockfile entries present there
+    are not new, even if base has moved on since."""
+    rc = subprocess.run(
+        ["git", "merge-base", f"origin/{base_ref}", "HEAD"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    sha = rc.stdout.strip()
+    return sha if rc.returncode == 0 and sha else None
 
 
 def file_at_ref(ref: str, path: str) -> str | None:
@@ -136,8 +222,10 @@ DEFAULT_PRIVATE_REGISTRY_HOSTS = "sfw.semianalysis.com"
 # false-positive on comments or documentation strings.
 LOCKFILE_NAMES = (
     "package-lock.json",
+    "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
     "Pipfile.lock",
     "poetry.lock",
     "uv.lock",
@@ -213,23 +301,13 @@ def private_registry_report(findings: list[dict[str, Any]]) -> str:
 # ----------------------------------------------------------------------------
 
 def parse_npm_lock(text: str) -> dict[str, str]:
-    """Return {pkg_name: version} from a package-lock.json (v2+)."""
+    """Return {pkg_name: version} from a package-lock.json. Kept for
+    scan_new_repos; the PR check uses lock_npm() so nested copies of one
+    package at different versions are all checked."""
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        return _pairs_to_dict(lock_npm(text).pairs)
+    except LockfileError:
         return {}
-    out: dict[str, str] = {}
-    for path, info in (data.get("packages") or {}).items():
-        if not path or path == "":
-            continue  # root package
-        # Extract pkg name from "node_modules/foo" or "node_modules/@scope/foo"
-        m = re.match(r"^(?:.*/)?node_modules/((?:@[^/]+/)?[^/]+)$", path)
-        if not m:
-            continue
-        version = info.get("version")
-        if version:
-            out[m.group(1)] = version
-    return out
 
 
 # Non-registry spec prefixes — packages declared this way are not
@@ -360,78 +438,547 @@ def parse_pyproject(text: str) -> dict[str, str]:
 
 
 def parse_uv_lock(text: str) -> dict[str, str]:
-    """Return {pkg: version} from uv.lock."""
+    """Return {pkg: version} from uv.lock (registry packages from PyPI only)."""
     try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # type: ignore
-    try:
-        data = tomllib.loads(text)
-    except Exception:
+        return _pairs_to_dict(lock_uv(text).pairs)
+    except LockfileError:
         return {}
-    out: dict[str, str] = {}
-    for pkg in data.get("package", []) or []:
-        name = pkg.get("name")
-        version = pkg.get("version")
-        if name and version:
-            out[name.lower()] = version
-    return out
 
 
 def parse_poetry_lock(text: str) -> dict[str, str]:
-    """Return {pkg: version} from poetry.lock."""
+    """Return {pkg: version} from poetry.lock (PyPI packages only)."""
     try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # type: ignore
-    try:
-        data = tomllib.loads(text)
-    except Exception:
+        return _pairs_to_dict(lock_poetry(text).pairs)
+    except LockfileError:
         return {}
-    out: dict[str, str] = {}
-    for pkg in data.get("package", []) or []:
-        name = pkg.get("name")
-        version = pkg.get("version")
-        if name and version:
-            out[name.lower()] = version
-    return out
 
 
 def parse_pipfile_lock(text: str) -> dict[str, str]:
-    """Return {pkg: version} from Pipfile.lock."""
+    """Return {pkg: version} from Pipfile.lock (PyPI packages only)."""
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        return _pairs_to_dict(lock_pipfile(text).pairs)
+    except LockfileError:
         return {}
-    out: dict[str, str] = {}
-    for section in ("default", "develop"):
-        for name, info in (data.get(section) or {}).items():
-            v = (info or {}).get("version", "").lstrip("=")
-            if v:
-                out[name.lower()] = v
-    return out
 
 
 # ----------------------------------------------------------------------------
-# Dispatch on filename
+# Lockfile parsers: exact (name, version) pairs the lockfile resolves to.
+#
+# Each returns every resolved pair, so two versions of one package (npm
+# nested copies) are both checked. Entries that do not come from the public
+# registry (workspace links, git, local paths, private registries) are
+# skipped and listed, because there is no public publish date to judge.
+# The org's sfw proxy fronts the public registries, so its URLs count as public.
+# ----------------------------------------------------------------------------
+
+class LockfileError(Exception):
+    """The lockfile could not be parsed. The check warns and moves on."""
+
+
+class LockResult:
+    def __init__(self) -> None:
+        self.pairs: set[tuple[str, str]] = set()
+        self.skipped: list[str] = []
+
+
+NPM_PUBLIC_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com"}
+PYPI_PUBLIC_HOSTS = {"pypi.org", "files.pythonhosted.org", "pypi.python.org"}
+MIRROR_HOSTS = {h.strip() for h in DEFAULT_PRIVATE_REGISTRY_HOSTS.split(",") if h.strip()}
+CRATES_SOURCES = (
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+)
+GO_PRIVATE_PREFIXES = (
+    "github.com/semianalysis/",
+    "github.com/semianalysis-capital/",
+    "github.com/semianalysisai/",
+    "github.com/citrini-research/",
+)
+_SEMVERISH = re.compile(r"^v?\d+(\.\d+)*([\-+.][0-9A-Za-z.\-+]*)?$")
+
+
+def _pairs_to_dict(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
+    return {name: version for name, version in sorted(pairs)}
+
+
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _semverish(version: str) -> bool:
+    return bool(_SEMVERISH.match(version))
+
+
+def _split_name_version(spec: str) -> tuple[str, str] | None:
+    """'@scope/name@1.2.3' -> ('@scope/name', '1.2.3')."""
+    idx = spec.rfind("@")
+    if idx <= 0:
+        return None
+    return spec[:idx], spec[idx + 1:]
+
+
+def _npm_public(resolved: str) -> bool:
+    if not resolved:
+        return True  # npm omits `resolved` for the default registry in some configs
+    if resolved.startswith(("http://", "https://")):
+        host = _host(resolved)
+        return host in NPM_PUBLIC_HOSTS or host in MIRROR_HOSTS
+    return False  # git+, file:, link:
+
+
+def _pypi_public(url: str) -> bool:
+    host = _host(url)
+    return host in PYPI_PUBLIC_HOSTS or host in MIRROR_HOSTS
+
+
+def _pypi_norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _add_pypi(out: LockResult, name: str, version: str) -> None:
+    if "+" in version:
+        out.skipped.append(f"{name}=={version} (local version, not on PyPI)")
+        return
+    out.pairs.add((_pypi_norm(name), version))
+
+
+def _toml(text: str) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise LockfileError(f"invalid TOML: {e}") from None
+
+
+def lock_npm(text: str) -> LockResult:
+    """package-lock.json / npm-shrinkwrap.json, lockfileVersion 1, 2 and 3."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise LockfileError(f"invalid JSON: {e}") from None
+    out = LockResult()
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        for path, info in packages.items():
+            if not path or not isinstance(info, dict) or "node_modules/" not in path:
+                continue  # root project or a workspace folder
+            if info.get("link") or info.get("inBundle"):
+                out.skipped.append(f"{path} (link or bundled)")
+                continue
+            name = info.get("name") or path.rsplit("node_modules/", 1)[1]
+            version = str(info.get("version") or "")
+            if not _semverish(version):
+                out.skipped.append(f"{path} (version {version!r})")
+                continue
+            if not _npm_public(str(info.get("resolved") or "")):
+                out.skipped.append(f"{name}@{version} (non-public source)")
+                continue
+            out.pairs.add((name, version))
+        return out
+
+    def walk(deps: dict) -> None:
+        for name, info in deps.items():
+            if not isinstance(info, dict):
+                continue
+            version = str(info.get("version") or "")
+            if info.get("bundled"):
+                out.skipped.append(f"{name} (bundled)")
+            elif _semverish(version) and _npm_public(str(info.get("resolved") or "")):
+                out.pairs.add((name, version))
+            else:
+                out.skipped.append(f"{name}@{version} (non-registry)")
+            if isinstance(info.get("dependencies"), dict):
+                walk(info["dependencies"])
+
+    if isinstance(data.get("dependencies"), dict):
+        walk(data["dependencies"])
+    return out
+
+
+def lock_pnpm(text: str) -> LockResult:
+    """pnpm-lock.yaml v5, v6 and v9, read line by line (no YAML library)."""
+    m = re.search(r"^lockfileVersion:\s*['\"]?(\d+)", text, re.MULTILINE)
+    if not m:
+        raise LockfileError("no lockfileVersion line")
+    major = int(m.group(1))
+    out = LockResult()
+    in_packages = False
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            in_packages = line.rstrip() == "packages:"
+            continue
+        if not in_packages:
+            continue
+        km = re.match(r"^  (?! )(['\"]?)(.+?)\1:(\s|$)", line)
+        if not km:
+            continue
+        key = km.group(2).split("(", 1)[0]  # v6/v9 peer suffix
+        if major <= 5:
+            if not key.startswith("/"):
+                out.skipped.append(key)
+                continue
+            parts = key[1:].split("/")
+            if key.startswith("/@") and len(parts) >= 3:
+                name, version = parts[0] + "/" + parts[1], parts[2]
+            elif not key.startswith("/@") and len(parts) >= 2:
+                name, version = parts[0], parts[1]
+            else:
+                out.skipped.append(key)
+                continue
+            version = version.split("_", 1)[0]  # v5 peer suffix
+        else:
+            split = _split_name_version(key.lstrip("/"))
+            if split is None:
+                out.skipped.append(key)
+                continue
+            name, version = split
+        if not _semverish(version):
+            out.skipped.append(key)
+            continue
+        out.pairs.add((name, version))
+    return out
+
+
+def _yarn_blocks(text: str):
+    header: str | None = None
+    body: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            if header is not None:
+                yield header, body
+            header, body = line.rstrip().rstrip(":"), {}
+            continue
+        if header is None or line.startswith("    "):
+            continue  # nested maps such as dependencies
+        km = re.match(r"^([\w\-]+):?\s+(.*)$", line.strip())
+        if km:
+            body[km.group(1)] = km.group(2).strip().strip('"')
+    if header is not None:
+        yield header, body
+
+
+def lock_yarn(text: str) -> LockResult:
+    """yarn.lock, classic (v1) and berry (v2+)."""
+    out = LockResult()
+    berry = bool(re.search(r"^__metadata:", text, re.MULTILINE))
+    for header, body in _yarn_blocks(text):
+        if berry:
+            if header.startswith("__metadata"):
+                continue
+            resolution = body.get("resolution", "")
+            idx = resolution.find("@npm:", 1)
+            if idx <= 0:
+                out.skipped.append(f"{header} (non-npm protocol)")
+                continue
+            name, version = resolution[:idx], resolution[idx + len("@npm:"):]
+        else:
+            version, resolved = body.get("version", ""), body.get("resolved", "")
+            if not resolved.startswith(("http://", "https://")) or not _npm_public(resolved):
+                out.skipped.append(f"{header} (non-public source)")
+                continue
+            path = urlparse(resolved).path
+            if "/-/" not in path:
+                out.skipped.append(f"{header} (unrecognised tarball URL)")
+                continue
+            # Name from the tarball path is alias-proof: /@scope/name/-/name-1.0.0.tgz
+            name = path.split("/-/", 1)[0].lstrip("/").replace("%2f", "/").replace("%2F", "/")
+        if not _semverish(version):
+            out.skipped.append(f"{header} (version {version!r})")
+            continue
+        out.pairs.add((name, version))
+    return out
+
+
+def _strip_jsonc(text: str) -> str:
+    """Remove // comments and trailing commas outside strings (bun.lock is JSONC)."""
+    out: list[str] = []
+    i, n, in_str = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if not (j < n and text[j] in "}]"):
+                out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def lock_bun(text: str) -> LockResult:
+    """bun.lock (text format, bun 1.2+). The binary bun.lockb is not parsed."""
+    try:
+        data = json.loads(_strip_jsonc(text))
+    except json.JSONDecodeError as e:
+        raise LockfileError(f"invalid bun.lock: {e}") from None
+    out = LockResult()
+    for key, entry in (data.get("packages") or {}).items():
+        if not isinstance(entry, list) or not entry or not isinstance(entry[0], str):
+            out.skipped.append(str(key))
+            continue
+        split = _split_name_version(entry[0])
+        registry = entry[1] if len(entry) > 1 and isinstance(entry[1], str) else ""
+        if split is None or not _semverish(split[1]):
+            out.skipped.append(f"{entry[0]} (non-registry)")
+            continue
+        if registry and not _npm_public(registry):
+            out.skipped.append(f"{entry[0]} (non-public source)")
+            continue
+        out.pairs.add(split)
+    return out
+
+
+def lock_uv(text: str) -> LockResult:
+    out = LockResult()
+    for pkg in _toml(text).get("package", []) or []:
+        name, version = pkg.get("name"), pkg.get("version")
+        source = pkg.get("source") or {}
+        if not name or not version:
+            continue
+        registry = source.get("registry") if isinstance(source, dict) else None
+        if not registry:
+            out.skipped.append(f"{name} (not from a registry)")
+        elif not _pypi_public(registry):
+            out.skipped.append(f"{name}=={version} (registry {registry})")
+        else:
+            _add_pypi(out, name, str(version))
+    return out
+
+
+def lock_poetry(text: str) -> LockResult:
+    out = LockResult()
+    for pkg in _toml(text).get("package", []) or []:
+        name, version = pkg.get("name"), pkg.get("version")
+        if not name or not version:
+            continue
+        source = pkg.get("source")
+        if isinstance(source, dict) and source:
+            stype = source.get("type", "")
+            if stype in ("git", "directory", "file", "url") or not _pypi_public(source.get("url", "")):
+                out.skipped.append(f"{name}=={version} (source {stype or source.get('url')})")
+                continue
+        _add_pypi(out, name, str(version))
+    return out
+
+
+def lock_pipfile(text: str) -> LockResult:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise LockfileError(f"invalid JSON: {e}") from None
+    out = LockResult()
+    sources = {s.get("name"): s.get("url", "") for s in (data.get("_meta") or {}).get("sources", []) or []}
+    for section in ("default", "develop"):
+        for name, info in (data.get(section) or {}).items():
+            if not isinstance(info, dict):
+                continue
+            if any(k in info for k in ("git", "path", "file", "editable")):
+                out.skipped.append(f"{name} (not from a registry)")
+                continue
+            version = str(info.get("version") or "")
+            if not version.startswith("=="):
+                out.skipped.append(f"{name} (version {version!r})")
+                continue
+            index = info.get("index")
+            if index and index in sources and not _pypi_public(sources[index]):
+                out.skipped.append(f"{name}{version} (index {index})")
+                continue
+            _add_pypi(out, name, version[2:])
+    return out
+
+
+_REQ_PIN_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._\-]*)\s*(\[[^\]]*\])?\s*===?\s*(?P<version>[^\s;,\\]+)\s*(;.*)?$"
+)
+
+
+def _requirement_lines(text: str):
+    """Logical requirement lines: continuations joined, comments and inline --options removed."""
+    joined = re.sub(r"\\\r?\n", " ", text)
+    for raw in joined.splitlines():
+        line = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if line:
+            yield line
+
+
+def lock_requirements_pins(text: str) -> LockResult:
+    """`name==version` lines from a requirements file. Ranges are ignored here;
+    they are manifest entries (see requirements_ranges)."""
+    out = LockResult()
+    for line in _requirement_lines(text):
+        m_index = re.match(r"^(--index-url|-i)[\s=]+(\S+)", line)
+        if m_index:
+            if not _pypi_public(m_index.group(2)):
+                skipped = out.skipped + [f"whole file (index {m_index.group(2)})"]
+                out = LockResult()
+                out.skipped = skipped
+                return out
+            continue
+        if line.startswith("-"):
+            continue
+        line = re.sub(r"\s--\S+", "", line).strip()
+        if " @ " in line or "://" in line:
+            out.skipped.append(f"{line[:60]} (direct reference)")
+            continue
+        m = _REQ_PIN_RE.match(line)
+        if m and "*" not in m.group("version"):
+            _add_pypi(out, m.group("name"), m.group("version"))
+    return out
+
+
+def requirements_ranges(text: str) -> dict[str, str]:
+    """Non-pinned requirement lines ({pkg: spec}), for range resolution."""
+    out: dict[str, str] = {}
+    for line in _requirement_lines(text):
+        if line.startswith("-") or " @ " in line or "://" in line:
+            continue
+        line = re.sub(r"\s--\S+", "", line).strip()
+        if _REQ_PIN_RE.match(line):
+            continue
+        m = REQ_LINE_RE.match(line)
+        if m:
+            out[m.group(1).lower()] = (m.group(3) or "").strip() or "*"
+    return out
+
+
+def lock_cargo(text: str) -> LockResult:
+    out = LockResult()
+    for pkg in _toml(text).get("package", []) or []:
+        name, version, source = pkg.get("name"), pkg.get("version"), str(pkg.get("source") or "")
+        if not name or not version or not source:
+            continue  # workspace member
+        if not source.startswith(CRATES_SOURCES):
+            out.skipped.append(f"{name}@{version} ({source.split('#')[0]})")
+            continue
+        out.pairs.add((name, str(version)))
+    return out
+
+
+def lock_go(text: str) -> LockResult:
+    """go.sum lines that hash module code. `/go.mod`-only lines are module-graph
+    entries whose code the build never downloads."""
+    out = LockResult()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[1].endswith("/go.mod"):
+            continue
+        module, version = parts[0], parts[1]
+        if module.lower().startswith(GO_PRIVATE_PREFIXES):
+            out.skipped.append(f"{module} (private module)")
+            continue
+        out.pairs.add((module, version))
+    return out
+
+
+# filename -> (ecosystem, parser)
+LOCKFILE_PARSERS = {
+    "package-lock.json": ("npm", lock_npm),
+    "npm-shrinkwrap.json": ("npm", lock_npm),
+    "pnpm-lock.yaml": ("npm", lock_pnpm),
+    "yarn.lock": ("npm", lock_yarn),
+    "bun.lock": ("npm", lock_bun),
+    "uv.lock": ("pypi", lock_uv),
+    "poetry.lock": ("pypi", lock_poetry),
+    "Pipfile.lock": ("pypi", lock_pipfile),
+    "Cargo.lock": ("cargo", lock_cargo),
+    "go.sum": ("go", lock_go),
+}
+
+# Manifest name -> lockfiles that pin its ranges.
+NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock")
+PY_LOCKFILES = ("uv.lock", "poetry.lock", "Pipfile.lock")
+
+
+def _is_requirements(name: str) -> bool:
+    return name.startswith("requirements") and name.endswith(".txt")
+
+
+def lockfile_pairs(path: str, text: str) -> tuple[str, LockResult] | None:
+    """(ecosystem, LockResult) for a lockfile or a requirements file's == pins.
+    None for manifests. Raises LockfileError on malformed input."""
+    name = path.rsplit("/", 1)[-1]
+    try:
+        if name in LOCKFILE_PARSERS:
+            eco, parser = LOCKFILE_PARSERS[name]
+            return eco, parser(text)
+        if _is_requirements(name):
+            return "pypi", lock_requirements_pins(text)
+    except LockfileError:
+        raise
+    except Exception as e:  # malformed input must never crash the check
+        raise LockfileError(f"{type(e).__name__}: {e}") from None
+    return None
+
+
+def covering_lockfile(manifest_path: str, ref: str = "HEAD") -> str | None:
+    """Lockfile that resolves this manifest's ranges at `ref`, or None.
+
+    A lockfile in the same directory always counts. A lockfile in a parent
+    directory counts when it names the manifest's directory, which is how
+    npm, pnpm, yarn, bun and uv workspaces record their members.
+    """
+    parts = manifest_path.split("/")
+    name, directory = parts[-1], parts[:-1]
+    if name == "package.json":
+        candidates = NPM_LOCKFILES
+    elif name == "pyproject.toml" or _is_requirements(name):
+        candidates = PY_LOCKFILES
+    else:
+        return None
+    rel_dir = "/".join(directory)
+    for depth in range(len(directory), -1, -1):
+        prefix = "/".join(directory[:depth])
+        for lock in candidates:
+            lock_path = f"{prefix}/{lock}" if prefix else lock
+            text = file_at_ref(ref, lock_path)
+            if text is None:
+                continue
+            if depth == len(directory) or (rel_dir and rel_dir[len(prefix):].lstrip("/") in text):
+                return lock_path
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Dispatch on filename (used by scan_new_repos full scans)
 # ----------------------------------------------------------------------------
 
 def parse_file(path: str, text: str) -> tuple[str, dict[str, str]]:
     name = path.rsplit("/", 1)[-1]
-    if name == "package-lock.json":
-        return ("npm", parse_npm_lock(text))
     if name == "package.json":
         return ("npm-spec", parse_npm_package_json(text))
-    if name == "uv.lock":
-        return ("pypi", parse_uv_lock(text))
-    if name == "poetry.lock":
-        return ("pypi", parse_poetry_lock(text))
-    if name == "Pipfile.lock":
-        return ("pypi", parse_pipfile_lock(text))
     if name == "pyproject.toml":
         return ("pypi-spec", parse_pyproject(text))
-    if name.startswith("requirements") and name.endswith(".txt"):
+    if _is_requirements(name):
         return ("pypi-spec", parse_requirements_txt(text))
+    if name in LOCKFILE_PARSERS:
+        eco, parser = LOCKFILE_PARSERS[name]
+        try:
+            return (eco, _pairs_to_dict(parser(text).pairs))
+        except Exception:
+            return (eco, {})
     return ("unknown", {})
 
 
@@ -439,17 +986,47 @@ def parse_file(path: str, text: str) -> tuple[str, dict[str, str]]:
 # Registry lookups (concurrent, batched)
 # ----------------------------------------------------------------------------
 
+def _parse_ts(ts: str | None) -> dt.datetime | None:
+    """ISO 8601 from any registry, as an aware UTC datetime. None if unparseable."""
+    if not ts:
+        return None
+    text = ts.strip().replace("Z", "+00:00")
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)  # Go proxy returns nanoseconds
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
 def npm_publish_time(pkg: str, version: str) -> dt.datetime | None:
     data = fetch_json(f"{NPM_REGISTRY}/{pkg}")
     if not data:
         return None
-    ts = (data.get("time") or {}).get(version)
-    if not ts:
+    return _parse_ts((data.get("time") or {}).get(version))
+
+
+def cargo_publish_time(crate: str, version: str) -> dt.datetime | None:
+    data = fetch_json(f"{CRATES_API}/{urllib.parse.quote(crate)}/{urllib.parse.quote(version)}")
+    if not data:
         return None
-    try:
-        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
+    return _parse_ts((data.get("version") or {}).get("created_at"))
+
+
+def _go_escape(path: str) -> str:
+    """Go module proxy case encoding: uppercase becomes '!' + lowercase."""
+    return "".join("!" + c.lower() if c.isupper() else c for c in path)
+
+
+def go_publish_time(module: str, version: str) -> dt.datetime | None:
+    if not version.startswith("v"):
+        version = "v" + version
+    data = fetch_json(f"{GO_PROXY}/{_go_escape(module)}/@v/{_go_escape(version)}.info")
+    if not data:
         return None
+    return _parse_ts(data.get("Time"))
 
 
 def npm_resolve_range_latest(pkg: str, spec: str) -> str | None:
@@ -559,16 +1136,11 @@ def pypi_publish_time(pkg: str, version: str) -> dt.datetime | None:
         return None
     releases = data.get("releases") or {}
     files = releases.get(version) or []
-    if not files:
-        return None
-    # Each file in the version has an upload_time_iso_8601
-    ts = files[0].get("upload_time_iso_8601") or files[0].get("upload_time")
-    if not ts:
-        return None
-    try:
-        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return None
+    # PyPI lets a maintainer add new files to an old release, so judge the
+    # release by its NEWEST file: a late upload cannot ride on an old date.
+    stamps = [_parse_ts(f.get("upload_time_iso_8601") or f.get("upload_time")) for f in files]
+    stamps = [t for t in stamps if t is not None]
+    return max(stamps) if stamps else None
 
 
 def pypi_resolve_spec_latest(pkg: str, spec: str) -> str | None:
@@ -634,6 +1206,10 @@ def lookup_publish_time(ecosystem: str, pkg: str, version_or_spec: str) -> tuple
         if not resolved:
             return version_or_spec, None
         return resolved, pypi_publish_time(pkg, resolved)
+    if ecosystem == "cargo":
+        return version_or_spec, cargo_publish_time(pkg, version_or_spec)
+    if ecosystem == "go":
+        return version_or_spec, go_publish_time(pkg, version_or_spec)
     return version_or_spec, None
 
 
@@ -642,24 +1218,28 @@ def lookup_publish_time(ecosystem: str, pkg: str, version_or_spec: str) -> tuple
 # ----------------------------------------------------------------------------
 
 def age_check_packages(
-    pairs: dict[str, dict[str, str]],
+    pairs: dict[str, Any],
     cooldown_days: int,
     allowed_scopes: set[str],
 ) -> list[dict[str, Any]]:
-    """Fan out registry lookups for {ecosystem: {pkg: version_or_spec}} and
-    return one result dict per package with age/young/skipped fields."""
+    """Fan out registry lookups and return one result dict per package with
+    age/young/skipped fields. `pairs` maps ecosystem to either
+    {pkg: version_or_spec} or an iterable of (pkg, version) tuples (lockfiles
+    can hold several versions of one package). A result with
+    "unresolved": True had no readable publish date after retries."""
     now = dt.datetime.now(dt.timezone.utc)
     threshold = dt.timedelta(days=cooldown_days)
 
     def check_one(ecosystem: str, pkg: str, ver: str) -> dict[str, Any]:
-        if "/" in pkg:
+        if ecosystem.startswith("npm") and pkg.startswith("@") and "/" in pkg:
             scope = "@" + pkg.split("/")[0].lstrip("@")
             if scope in allowed_scopes:
                 return {"pkg": pkg, "version": ver, "skipped": "allowlisted scope"}
         resolved, publish_time = lookup_publish_time(ecosystem, pkg, ver)
         if publish_time is None:
             return {"pkg": pkg, "version": ver, "resolved": resolved,
-                    "publish_time": None, "age_days": None, "ecosystem": ecosystem}
+                    "publish_time": None, "age_days": None, "ecosystem": ecosystem,
+                    "unresolved": True}
         age = now - publish_time
         return {
             "pkg": pkg, "version": ver, "resolved": resolved,
@@ -673,7 +1253,7 @@ def age_check_packages(
         tasks = [
             (ecosystem, pkg, ver)
             for ecosystem, items in pairs.items()
-            for pkg, ver in items.items()
+            for pkg, ver in (sorted(items.items()) if isinstance(items, dict) else sorted(items))
         ]
         return list(ex.map(lambda t: check_one(*t), tasks))
 
@@ -707,7 +1287,7 @@ def main() -> int:
     paths = changed_files(base_ref)
     log(f"[cooldown] changed dep files: {len(paths)}")
     if not paths:
-        write_summary("Γ£à No dependency files changed.")
+        write_summary("✅ No dependency files changed.")
         return 0
 
     # Private-registry tripwire. Runs on every changed lockfile even when no
@@ -722,29 +1302,31 @@ def main() -> int:
     if registry_findings:
         log(f"[registry] {len(registry_findings)} private-registry URL(s) introduced")
 
-    # Build before/after package sets
-    pairs: dict[str, dict[str, str]] = {}  # ecosystem -> {pkg: new_version}
-    for path in paths:
-        before_text = file_at_ref(f"origin/{base_ref}", path) or ""
-        after_text = file_at_ref("HEAD", path) or ""
-        eco_b, before = parse_file(path, before_text)
-        eco_a, after = parse_file(path, after_text)
-        ecosystem = eco_a or eco_b
-        if ecosystem == "unknown":
-            continue
-        for pkg, ver in after.items():
-            # New or version-changed
-            if before.get(pkg) != ver:
-                pairs.setdefault(ecosystem, {})[pkg] = ver
-        log(f"  {path} [{ecosystem}]: {len(after)-len(before):+d} new/changed entries")
+    # Build the set of package versions this PR introduces.
+    #
+    # Lockfiles (and == pins in requirements files): pairs resolved at HEAD
+    # that are in neither the base tip nor the merge base.
+    # Manifests (package.json, pyproject.toml, requirements ranges): only when
+    # no lockfile covers them (lockfile-first); then each new or changed range
+    # resolves to its newest registry match, as before.
+    merge_base = merge_base_ref(base_ref)
+    old_refs = [f"origin/{base_ref}"] + ([merge_base] if merge_base else [])
+    pairs, lockfile_warnings = collect_pairs(paths, old_refs)
+    lockfile_warnings += [
+        f"`{p}` changed, but this lockfile format is not parsed: package ages NOT checked."
+        for p in changed_unparsed_lockfiles(base_ref)
+    ]
+    for w in lockfile_warnings:
+        print(f"::warning::{w}", flush=True)
+    warnings_md = ("\n\n### Warnings\n\n" + "\n".join(f"- {w}" for w in lockfile_warnings)) if lockfile_warnings else ""
 
     if not pairs:
         if registry_findings:
             report = private_registry_report(registry_findings)
-            write_summary(report)
+            write_summary(report + warnings_md)
             post_pr_comment(report)
             return 1
-        write_summary("Γ£à Dependency files touched but no new or version-changed packages detected.")
+        write_summary("✅ Dependency files touched but no new or version-changed packages detected." + warnings_md)
         return 0
 
     total_to_check = sum(len(v) for v in pairs.values())
@@ -753,18 +1335,17 @@ def main() -> int:
     results = age_check_packages(pairs, cooldown_days, allowed_scopes)
 
     young = [r for r in results if r.get("young")]
-    unresolved = [r for r in results if r.get("publish_time") is None and "skipped" not in r]
+    unresolved = [r for r in results if r.get("unresolved")]
 
-    if not young:
-        msg = (f"Γ£à {len(results)} new/changed package(s) checked, none younger than {cooldown_days} days. "
-               f"({len(unresolved)} could not be resolved against the registry ΓÇö out of scope.)")
+    if not young and not unresolved:
+        msg = f"✅ {len(results)} new/changed package(s) checked, none younger than {cooldown_days} days."
         log(msg)
         if registry_findings:
             report = private_registry_report(registry_findings)
-            write_summary(msg + "\n\n" + report)
+            write_summary(msg + "\n\n" + report + warnings_md)
             post_pr_comment(report)
             return 1
-        write_summary(msg)
+        write_summary(msg + warnings_md)
         return 0
 
     # We have a finding. Build the report.
@@ -772,21 +1353,39 @@ def main() -> int:
     report_lines = [
         f"# 🚨 Supply-chain cooldown check failed",
         f"",
-        f"**{len(young)} package(s) below the {cooldown_days}-day cooldown threshold.**",
-        f"",
-        f"This guards against supply-chain attacks (e.g. Mini Shai-Hulud) where a malicious version is published and exfiltrates within hours. Wait until the version ages out, pin to an older known-good version, or add the `{override_label}` label after manual review of the package's publish history.",
-        f"",
-        f"| Ecosystem | Package | Version | Published | Age |",
-        f"|---|---|---|---|---|",
     ]
-    for r in young:
-        days = r["age_days"]
-        age_str = f"{days*24:.1f} hours" if days < 1 else f"{days:.1f} days"
-        report_lines.append(
-            f"| {r['ecosystem']} | `{r['pkg']}` | `{r['resolved']}` | {r['publish_time'][:19]} | **{age_str}** |"
-        )
+    if young:
+        report_lines += [
+            f"**{len(young)} package(s) below the {cooldown_days}-day cooldown threshold.**",
+            f"",
+            f"This guards against supply-chain attacks (e.g. Mini Shai-Hulud) where a malicious version is published and exfiltrates within hours. Wait until the version ages out, pin to an older known-good version, or add the `{override_label}` label after manual review of the package's publish history.",
+            f"",
+            f"| Ecosystem | Package | Version | Published | Age | Eligible (UTC) |",
+            f"|---|---|---|---|---|---|",
+        ]
+        for r in young:
+            days = r["age_days"]
+            age_str = f"{days*24:.1f} hours" if days < 1 else f"{days:.1f} days"
+            eligible = dt.datetime.fromisoformat(r["publish_time"]) + dt.timedelta(days=cooldown_days)
+            report_lines.append(
+                f"| {r['ecosystem']} | `{r['pkg']}` | `{r['resolved']}` | {r['publish_time'][:19]} "
+                f"| **{age_str}** | {eligible:%Y-%m-%d %H:%M} |"
+            )
+        report_lines.append("")
+    if unresolved:
+        report_lines += [
+            f"**{len(unresolved)} package version(s) could not be verified.** The registry gave no "
+            f"publish date after {FETCH_ATTEMPTS} attempts (registry down, version not published, or "
+            f"a private package). The check fails closed: re-run it once the registry answers, or add "
+            f"the `{override_label}` label after checking each package by hand.",
+            f"",
+            f"| Ecosystem | Package | Version |",
+            f"|---|---|---|",
+        ]
+        for r in sorted(unresolved, key=lambda r: (r["ecosystem"], r["pkg"])):
+            report_lines.append(f"| {r['ecosystem']} | `{r['pkg']}` | `{r['resolved']}` |")
+        report_lines.append("")
     report_lines += [
-        "",
         f"## How to unblock",
         f"",
         f"1. **Wait it out.** Most safe choice. The package will pass the check in {cooldown_days} days minus its current age.",
@@ -799,9 +1398,68 @@ def main() -> int:
     if registry_findings:
         report += "\n\n" + private_registry_report(registry_findings)
 
-    write_summary(report)
+    write_summary(report + warnings_md)
     post_pr_comment(report)
     return 1
+
+
+def collect_pairs(paths: list[str], old_refs: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """ecosystem -> new pairs (set of (pkg, version)) or {pkg: spec} for
+    manifest ranges, plus warnings for files that could not be parsed."""
+    pairs: dict[str, Any] = {}
+    warnings: list[str] = []
+    for path in paths:
+        after_text = file_at_ref("HEAD", path)
+        if after_text is None:
+            continue  # deleted by the PR
+        name = path.rsplit("/", 1)[-1]
+
+        # 1. Lockfile-resolved versions (lockfiles, requirements == pins).
+        try:
+            parsed = lockfile_pairs(path, after_text)
+        except LockfileError as e:
+            warnings.append(f"`{path}` could not be parsed ({e}): package ages NOT checked.")
+            parsed = None
+        if parsed is not None:
+            eco, after = parsed
+            before: set[tuple[str, str]] = set()
+            for ref in old_refs:
+                old_text = file_at_ref(ref, path)
+                if old_text is None:
+                    continue
+                try:
+                    old = lockfile_pairs(path, old_text)
+                except LockfileError:
+                    continue  # an unreadable old version only makes the check stricter
+                if old is not None:
+                    before |= old[1].pairs
+            new = after.pairs - before
+            if new:
+                pairs.setdefault(eco, set()).update(new)
+            log(f"  {path} [{eco}]: {len(new)} new version(s), {len(after.skipped)} non-registry entr(y/ies) skipped")
+
+        # 2. Manifest ranges, only when no lockfile resolves them.
+        if name not in ("package.json", "pyproject.toml") and not _is_requirements(name):
+            continue
+        lock = covering_lockfile(path)
+        if lock is not None:
+            log(f"  {path}: ranges resolved by {lock}; judging lockfile versions only")
+            continue
+        if name == "package.json":
+            eco, parse = "npm-spec", parse_npm_package_json
+        elif name == "pyproject.toml":
+            eco, parse = "pypi-spec", parse_pyproject
+        else:
+            eco, parse = "pypi-spec", requirements_ranges
+        after_specs = parse(after_text)
+        before_specs: dict[str, str] = {}
+        for ref in old_refs[:1]:
+            before_specs = parse(file_at_ref(ref, path) or "")
+        changed = {pkg: spec for pkg, spec in after_specs.items() if before_specs.get(pkg) != spec}
+        if changed:
+            pairs.setdefault(eco, {}).update(changed)
+        log(f"  {path} [{eco}, no lockfile]: {len(changed)} new/changed range(s)")
+    return pairs, warnings
 
 
 def write_summary(text: str) -> None:
