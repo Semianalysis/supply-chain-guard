@@ -160,3 +160,5 @@ A same-repo PR into `main` passes when one of these is true:
 4. The only change is this workflow file, set to the exact canonical template (to roll out updates).
 
 Forks never pass. CI and `cooldown-check` still apply to every PR.
+
+Hardened variant: [`templates/main-promotion-guard-target.yml`](templates/main-promotion-guard-target.yml) uses `pull_request_target`, so the guard runs from the base branch and a PR cannot rewrite it. Repos that already used `pull_request_target` keep that trigger. It never checks out PR code, and its token is read-only.
