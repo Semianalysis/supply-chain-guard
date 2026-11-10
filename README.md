@@ -141,3 +141,22 @@ Entries from non-public sources (workspace links, git, local paths, private regi
 Lockfiles the action knows but cannot parse (`bun.lockb`, `Gemfile.lock`, `composer.lock` and similar) produce a warning in the summary, never a failure. A malformed lockfile does the same.
 
 PyPI publish time is the **newest** upload in the release: PyPI lets maintainers add files to an old release, and the newest file is what a late attack would add.
+
+## main-promotion-guard (route into `main`)
+
+Repos with a `staging` branch keep `.github/workflows/main-promotion-guard.yml`, a copy of
+[`templates/main-promotion-guard.yml`](templates/main-promotion-guard.yml). Its job is named
+`main-promotion-guard` because repo rulesets require a check with that name. The job runs
+[`promotion_guard.py`](promotion_guard.py) from this repo's `main`, so the rules change in one place.
+
+A same-repo PR into `main` passes when one of these is true:
+
+1. The head branch is `staging` (a promotion).
+2. The author is `dependabot[bot]`. Security updates always target the default branch.
+3. A dependency-only security hotfix: the author is a dependabot-autopilot app, or the PR has the
+   `security/hotfix` label, AND every changed file is a lockfile, a `requirements*.txt` /
+   `constraints*.txt` file, or a `package.json` / `pyproject.toml` where only the dependency
+   fields change. Nothing under `.github/`, and no removed or renamed files.
+4. The only change is this workflow file, set to the exact canonical template (to roll out updates).
+
+Forks never pass. CI and `cooldown-check` still apply to every PR.
