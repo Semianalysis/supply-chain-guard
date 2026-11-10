@@ -1,4 +1,17 @@
 {
   "version": 1,
-  "exceptions": []
+  "exceptions": [
+    {
+      "id": "GHSA-2222-2222-2222",
+      "ecosystem": "npm",
+      "package": "@types/vscode",
+      "version": "1.145.0",
+      "integrity": "sha512-mADZK4SF/j1n0+Qk4bH8NT1qTQGYDAsbhb5hStbzuB3hKP3mRH7xja5yUaIm7ExCh65Ff+C9XGwxcBvSlTCvkQ==",
+      "published_at": "2026-11-04T15:34:38Z",
+      "expires": "2026-11-11T15:34:38Z",
+      "approved_by": "Kyle Johntz Connor",
+      "approved_at": "2026-11-10T17:33:51Z",
+      "request": "#6"
+    }
+  ]
 }
