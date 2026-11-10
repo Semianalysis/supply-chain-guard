@@ -156,3 +156,14 @@ def test_is_lock():
 def test_empty_hotfix_fails(n_files):
     ok, msg = pg.decide(pr(labels=HOTFIX), REPO, fake([]))
     assert not ok and "no changed files" in msg
+
+
+def test_hardened_template_variant():
+    plain, target = pg.canonical_templates()
+    assert "\n  pull_request:\n" in plain and "pull_request_target" not in plain
+    assert "\n  pull_request_target:\n" in target
+    assert "\n  main-promotion-guard:\n" in target
+    ok, msg = pg.decide(pr(), REPO, fake([(pg.GUARD_PATH, "modified")], {(pg.GUARD_PATH, "h"): target}))
+    assert ok and "canonical" in msg
+    # The hardened file must never check out the PR: only this repo's rules.
+    assert "ref: main" in target and "head.sha" not in target

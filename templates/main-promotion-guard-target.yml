@@ -1,0 +1,40 @@
+name: main-promotion-guard
+
+# Fails any PR into main that is not a staging promotion, a Dependabot update,
+# or a dependency-only security hotfix. The rules live in one place:
+# Semianalysis/supply-chain-guard, promotion_guard.py. Keep this file equal to
+# templates/main-promotion-guard-target.yml there. The job name must stay
+# `main-promotion-guard`: rulesets require a check with that name.
+#
+# Hardened variant: `pull_request_target` runs this file from the BASE branch,
+# so a PR into main cannot rewrite the guard to pass itself. It never checks
+# out PR code, and the token is read-only.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: main-promotion-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  main-promotion-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Get the guard rules
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: Semianalysis/supply-chain-guard
+          ref: main
+          path: .supply-chain-guard
+          persist-credentials: false
+      - name: Check the route into main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .supply-chain-guard/promotion_guard.py

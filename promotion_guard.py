@@ -20,7 +20,7 @@ A same-repo PR into main passes when ONE of these is true:
      change (scripts, build settings and everything else must stay equal).
    No file may be removed or renamed.
 4. Guard update: the only change is this workflow file, and its new content is
-   exactly the canonical template. This lets the guard itself be rolled out.
+   exactly one of the canonical templates. This lets the guard itself be rolled out.
 
 Everything else fails, as before. Forks never pass. The usual required checks
 (CI, cooldown-check) still apply to every PR; this script only decides the
@@ -46,7 +46,8 @@ from typing import Any, Callable
 
 HOTFIX_LABEL = "security/hotfix"
 GUARD_PATH = ".github/workflows/main-promotion-guard.yml"
-TEMPLATE = Path(__file__).resolve().parent / "templates" / "main-promotion-guard.yml"
+TEMPLATES = [Path(__file__).resolve().parent / "templates" / n
+             for n in ("main-promotion-guard.yml", "main-promotion-guard-target.yml")]
 
 AUTOPILOT_APPS = {
     "sa-dependabot-autopilot[bot]",
@@ -187,8 +188,13 @@ def manifest_only_deps_changed(path: str, before: str | None, after: str | None)
     return None
 
 
+def canonical_templates() -> list[str]:
+    """The `pull_request` template and the hardened `pull_request_target` one."""
+    return [t.read_text(encoding="utf-8").replace("\r\n", "\n") for t in TEMPLATES]
+
+
 def canonical_template() -> str:
-    return TEMPLATE.read_text(encoding="utf-8").replace("\r\n", "\n")
+    return canonical_templates()[0]
 
 
 def decide(pr: dict, repo: str, fetch: Fetch) -> tuple[bool, str]:
@@ -211,7 +217,7 @@ def decide(pr: dict, repo: str, fetch: Fetch) -> tuple[bool, str]:
 
     if paths == [GUARD_PATH] and files[0].get("status") == "modified":
         new = file_text(fetch, repo, GUARD_PATH, head["sha"])
-        if new is not None and new.replace("\r\n", "\n") == canonical_template():
+        if new is not None and new.replace("\r\n", "\n") in canonical_templates():
             return True, "Allowed: update of this guard to the canonical template."
         return False, "This PR changes the guard, and the new file is not the canonical template."
 
