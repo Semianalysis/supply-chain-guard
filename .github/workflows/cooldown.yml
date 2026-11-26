@@ -65,4 +65,3 @@ jobs:
           allowed_scopes: ${{ inputs.allowed_scopes || '@types' }}
           override_label: ${{ inputs.override_label || 'security/cooldown-override' }}
           private_registry_hosts: ${{ inputs.private_registry_hosts || 'sfw.semianalysis.com' }}
-
