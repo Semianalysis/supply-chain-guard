@@ -39,6 +39,7 @@ on:
         default: "sfw.semianalysis.com"
 
   pull_request: {}
+  merge_group: {}
 
 permissions:
   contents: read
@@ -50,12 +51,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history for diff)
+        if: github.event_name != 'merge_group'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Run cooldown check
+        if: github.event_name != 'merge_group'
         uses: Semianalysis/supply-chain-guard@main
         with:
           cooldown_days: ${{ inputs.cooldown_days || 7 }}
